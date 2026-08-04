@@ -1,0 +1,4 @@
+[submodule "src/andino_gz"]
+	path = src/andino_gz
+	url = https://github.com/ekumenlabs/andino_gz.git
+	branch = humble

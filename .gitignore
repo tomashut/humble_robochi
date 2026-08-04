@@ -1,0 +1,11 @@
+# Artefactos de colcon (se regeneran con `colcon build`)
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor
+.vscode/
