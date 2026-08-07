@@ -48,14 +48,34 @@ class PatrolNode(Node):
         rounds_log_dir = self.get_parameter('rounds_log_dir').get_parameter_value().string_value
         self.rounds_log_dir = Path(rounds_log_dir).expanduser()
         self.rounds_log_dir.mkdir(parents=True, exist_ok=True)
-        self.round_id = None
 
-        self.current_goal = 0
-        self.fail_count = 0
+        default_state_file = str(Path.home() / '.local' / 'share' / 'patrol_fsm' / 'state.json')
+        self.declare_parameter('state_file', default_state_file)
+        state_file = self.get_parameter('state_file').get_parameter_value().string_value
+        self.state_file = Path(state_file).expanduser()
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+        self.declare_parameter('auto_resume_timeout_sec', 300)
+        self.auto_resume_timeout_sec = (
+            self.get_parameter('auto_resume_timeout_sec').get_parameter_value().integer_value)
+        self._auto_resume_timer = None
+
+        saved_state = self._load_saved_state()
+        if saved_state is None:
+            self.current_goal = 0
+            self.fail_count = 0
+            self.round_id = None
+            previous_state = None
+        else:
+            self.current_goal = saved_state['current_goal']
+            self.fail_count = saved_state['fail_count']
+            self.round_id = saved_state['round_id']
+            previous_state = PatrolState(saved_state['state'])
+
         self._current_goal_handle = None
         self._expected_cancel = False
 
-        self.state = PatrolState.EN_BASE
+        self.state = previous_state or PatrolState.EN_BASE
 
         state_qos = QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
         self._state_pub = self.create_publisher(String, 'patrol_state', state_qos)
@@ -74,7 +94,15 @@ class PatrolNode(Node):
         self._action_client.wait_for_server()
         self.get_logger().info('Servidor listo.')
 
-        self._enter_state(PatrolState.EN_BASE)
+        if previous_state is None or previous_state in (PatrolState.EN_BASE, PatrolState.FALLA):
+            self._enter_state(previous_state or PatrolState.EN_BASE)
+        else:
+            self.get_logger().warn(
+                f'Estado persistido era {previous_state.value}; por seguridad arranca en PAUSADO '
+                'en vez de reanudar navegación solo. Pedí /resume_patrol o /return_to_base.')
+            self._log_event('reiniciado', estado_anterior=previous_state.value)
+            self._enter_state(PatrolState.PAUSADO)
+            self._schedule_auto_resume()
 
     # -- utilidades de pose -------------------------------------------------
 
@@ -115,6 +143,7 @@ class PatrolNode(Node):
         msg = String()
         msg.data = new_state.value
         self._state_pub.publish(msg)
+        self._save_state()
 
     def _call_later(self, delay_sec, fn):
         timer = self.create_timer(delay_sec, lambda: self._fire_once(timer, fn))
@@ -122,6 +151,62 @@ class PatrolNode(Node):
     def _fire_once(self, timer, fn):
         timer.cancel()
         fn()
+
+    def _resume(self, reason=None):
+        self._enter_state(PatrolState.EN_RONDA)
+        self._log_event('resumed', **({'reason': reason} if reason else {}))
+        self.send_next_goal()
+
+    def _schedule_auto_resume(self):
+        if self.auto_resume_timeout_sec <= 0:
+            return
+        self._auto_resume_timer = self.create_timer(
+            float(self.auto_resume_timeout_sec), self._fire_auto_resume)
+
+    def _cancel_auto_resume(self):
+        if self._auto_resume_timer is not None:
+            self._auto_resume_timer.cancel()
+            self._auto_resume_timer = None
+
+    def _fire_auto_resume(self):
+        self._cancel_auto_resume()
+        if self.state != PatrolState.PAUSADO:
+            return
+        self.get_logger().warn(
+            f'Nadie reanudo en {self.auto_resume_timeout_sec}s tras el reinicio; '
+            'reanudando la ronda sola.')
+        self._resume(reason='auto_tras_reinicio')
+
+    # -- persistencia de estado (sobrevive reinicios) --------------------------
+
+    def _load_saved_state(self):
+        if not self.state_file.exists():
+            return None
+
+        try:
+            with open(self.state_file) as f:
+                data = json.load(f)
+            PatrolState(data['state'])  # valida que el valor sea un estado conocido
+            if not (0 <= data['current_goal'] < len(self.waypoints)):
+                raise ValueError('current_goal fuera de rango')
+            return data
+        except (json.JSONDecodeError, OSError, KeyError, ValueError) as e:
+            self.get_logger().warn(
+                f'Estado persistido en {self.state_file} invalido o corrupto ({e}); '
+                'se ignora y arranca desde EN_BASE.')
+            return None
+
+    def _save_state(self):
+        payload = {
+            'state': self.state.value,
+            'current_goal': self.current_goal,
+            'fail_count': self.fail_count,
+            'round_id': self.round_id,
+        }
+        tmp_path = self.state_file.with_suffix('.tmp')
+        with open(tmp_path, 'w') as f:
+            json.dump(payload, f)
+        tmp_path.replace(self.state_file)
 
     # -- registro de rondas ("libro de rondas digital") -----------------------
 
@@ -140,9 +225,11 @@ class PatrolNode(Node):
     def _start_round(self):
         self.round_id = datetime.now().strftime('%Y%m%d-%H%M%S%f')[:-3]
         self._log_event('round_started')
+        self._save_state()
 
     def _end_round(self, result):
         self._log_event('round_ended', result=result)
+        self._save_state()
 
     # -- envío de goals -------------------------------------------------------
 
@@ -197,6 +284,8 @@ class PatrolNode(Node):
                 if self.current_goal == 0:
                     self._end_round('completada')
                     self._start_round()
+                else:
+                    self._save_state()
                 self._call_later(self.NEXT_WAYPOINT_DELAY_SEC, self.send_next_goal)
 
         elif status == GoalStatus.STATUS_CANCELED:
@@ -223,6 +312,7 @@ class PatrolNode(Node):
             self.get_logger().error(
                 'Máximo de reintentos alcanzado. Robot detenido, esperando /clear_failure.')
         else:
+            self._save_state()
             self._call_later(self.RETRY_DELAY_SEC, self.send_next_goal)
 
     def _cancel_active_goal(self):
@@ -264,9 +354,8 @@ class PatrolNode(Node):
             response.message = f'No se puede reanudar desde {self.state.value}.'
             return response
 
-        self._enter_state(PatrolState.EN_RONDA)
-        self._log_event('resumed')
-        self.send_next_goal()
+        self._cancel_auto_resume()
+        self._resume()
         response.success = True
         response.message = 'Ronda reanudada.'
         return response
@@ -277,6 +366,7 @@ class PatrolNode(Node):
             response.message = f'No se puede tomar control manual desde {self.state.value}.'
             return response
 
+        self._cancel_auto_resume()
         self._enter_state(PatrolState.MANUAL)
         self._cancel_active_goal()
         self._log_event('interrupted', reason='manual')
@@ -301,6 +391,7 @@ class PatrolNode(Node):
             response.message = f'No se puede retornar a base desde {self.state.value}.'
             return response
 
+        self._cancel_auto_resume()
         self._enter_state(PatrolState.RETORNO)
         self._cancel_active_goal()
         self._log_event('interrupted', reason='retorno_a_base')

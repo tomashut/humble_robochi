@@ -66,6 +66,25 @@ Para leer: es texto plano, una línea por evento — alcanza con `jq` mientras n
 jq 'select(.round_id == "20260807-143210123")' rondas/2026-08-07.jsonl
 ```
 
+## Persistencia de estado (sobrevive reinicios)
+
+**Esto ya está implementado — no es un pendiente.** El nodo guarda su estado (`state`, `current_goal`, `fail_count`, `round_id`) en un JSON (`state_file`, default `~/.local/share/patrol_fsm/state.json`) cada vez que algo de eso cambia, con escritura atómica (archivo temporal + rename) para no corromperlo si se corta la luz justo en el medio.
+
+Al arrancar, si encuentra un estado guardado:
+- Si era `EN_BASE` o `FALLA`, lo respeta tal cual (`FALLA` sigue exigiendo `/clear_failure` — un reinicio no debe borrar una falla real).
+- Si era cualquier otro estado activo (`EN_RONDA`, `PAUSADO`, `MANUAL`, `RETORNO`) — es decir, se cortó a media ronda — **nunca reanuda navegación solo**. Aterriza en `PAUSADO`, conservando `current_goal` y `round_id` intactos, y agrega un evento `reiniciado` al registro de ejecuciones (con `estado_anterior`) para que quede documentado por qué esa ronda se demoró. Hace falta `/resume_patrol` (continúa el mismo punto pendiente) o `/return_to_base` para que vuelva a moverse — nunca se mueve a ciegas después de un apagado no planeado.
+- Si el archivo de estado no existe, está corrupto, o tiene un `current_goal` fuera de rango, se ignora con un warning y arranca fresco desde `EN_BASE` (a diferencia del YAML de waypoints, que sí falla duro si está mal — acá preferimos degradar a un estado seguro antes que impedir que el nodo arranque).
+
+### Auto-reanudación tras un reinicio, si nadie contesta
+
+**También implementado, así funciona hoy por default — es personalizable.** Quedarse en `PAUSADO` para siempre tras un reinicio suena seguro, pero si es de noche y no hay nadie mirando el panel, el robot deja de patrullar indefinidamente por un simple corte de luz de 2 segundos — contradice el propósito de un robot de seguridad desatendido.
+
+Por eso, **solo en el caso de aterrizar en `PAUSADO` por un reinicio no planeado** (no aplica a un `/pause_patrol` manual y deliberado — ese respeta la decisión del operador y no se auto-reanuda), el nodo arranca un temporizador de `auto_resume_timeout_sec` segundos (parámetro/argumento de launch, **default 300 = 5 minutos**). Si nadie mandó `/resume_patrol`, `/manual_start` ni `/return_to_base` antes de que se cumpla ese plazo, el nodo reanuda la ronda solo (evento `resumed` con `reason: auto_tras_reinicio` en el registro, para que quede claro que no fue un operador). Si sí intervino un operador antes, el temporizador se cancela y no hace nada. `auto_resume_timeout_sec:=0` desactiva esto por completo (vuelve al comportamiento "espera humano para siempre") para instalaciones donde eso sea preferible.
+
+Si Nav2 vuelve a fallar tras la auto-reanudación, cae en el mismo camino de reintentos/`FALLA` de siempre — no hace falta lógica especial, la máquina de estados ya contiene ese caso.
+
+**Idea a futuro, todavía sin diseñar:** en vez de un timeout ciego, usar visión (cámara de percepción) + LiDAR con algo de procesamiento IA para verificar que el robot todavía entiende bien su posición/orientación y que el entorno inmediato es seguro antes de decidir auto-reanudar — en vez de confiar solo en que pasó tiempo sin que nadie contestara.
+
 ## Comportamientos no obvios (aprendidos probando en simulación)
 
 - **`start_patrol` y `resume_patrol` no "arrancan de cero"**: `current_goal` (el índice del waypoint pendiente) solo avanza cuando se completa un waypoint estando en `EN_RONDA`. Ni `return_to_base` ni `clear_failure` lo resetean. Entonces si mandás el robot a la base a mitad de ronda (`b`) y después arrancás de nuevo (`s`), retoma en el waypoint donde había quedado, no en el 0. Es el comportamiento buscado (no repetir lo ya recorrido), pero el nombre `start_patrol` puede confundir.
@@ -75,6 +94,5 @@ jq 'select(.round_id == "20260807-143210123")' rondas/2026-08-07.jsonl
 ## Qué falta (conocido, no implementado todavía)
 
 - **Sin acciones por punto ni agenda/horario** en el YAML de waypoints.
-- **Sin persistencia a disco** del estado de la máquina de estados (el registro de ejecuciones sí persiste, pero el estado actual del nodo no sobrevive un reinicio).
 - **Sin integración con twist_mux** (prioridades e-stop > teleoperación > navegación).
 - **Sin disparo automático de retorno a base** por batería baja — `return_to_base` es siempre manual.
