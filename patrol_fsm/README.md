@@ -31,6 +31,8 @@ Reintentos: hasta 5 fallos consecutivos de Nav2 (goal rechazado, abortado, o can
 
 `patrol_client.py` es un cliente de terminal interactivo para probar todo esto a mano: `s`/`p`/`r`/`m`/`b`/`c`/`q`. El comando `m` encadena `manual_start` → `teleop_twist_keyboard` → `manual_stop` automáticamente al salir del teleop con Ctrl+C.
 
+Los waypoints se leen de un YAML (`config/waypoints.yaml`, lista plana de `name`/`x`/`y`/`yaw`; el primero es la base) vía el parámetro ROS `waypoints_file`. Sin acciones por punto ni agenda todavía — eso es alcance futuro, cuando haya algo real que las use. Si el archivo falta o está mal formado, el nodo falla al arrancar en vez de arrancar en silencio con datos por defecto.
+
 ## Cómo correrlo
 
 Requiere la simulación Gazebo/Nav2 del Andino levantada primero (ver `andino_gz` en `src/`). Con eso arriba:
@@ -41,11 +43,17 @@ source install/setup.bash
 ros2 launch patrol_fsm patrol.launch.py
 ```
 
-Abre una terminal xterm con el cliente interactivo.
+Abre una terminal xterm con el cliente interactivo. Para usar un YAML de waypoints distinto (pensado para cuando haya más de un robot/instalación): `ros2 launch patrol_fsm patrol.launch.py waypoints_file:=/ruta/a/otro.yaml`.
+
+## Comportamientos no obvios (aprendidos probando en simulación)
+
+- **`start_patrol` y `resume_patrol` no "arrancan de cero"**: `current_goal` (el índice del waypoint pendiente) solo avanza cuando se completa un waypoint estando en `EN_RONDA`. Ni `return_to_base` ni `clear_failure` lo resetean. Entonces si mandás el robot a la base a mitad de ronda (`b`) y después arrancás de nuevo (`s`), retoma en el waypoint donde había quedado, no en el 0. Es el comportamiento buscado (no repetir lo ya recorrido), pero el nombre `start_patrol` puede confundir.
+- **Ctrl+C en el prompt `>` del cliente lo mata**, no solo cancela el comando en curso — `patrol_client` se cierra por completo (el robot sigue su goal actual sin enterarse, eso está bien). Como el launch levanta el cliente con `xterm -hold`, la ventana queda "viva" pero inútil, no vuelve a lanzar el cliente solo. Para recuperar el control: en cualquier terminal, `source install/setup.bash && ros2 run patrol_fsm patrol_client` — se reconecta a los mismos servicios del `patrol_node`, que sigue corriendo.
+- Dentro del modo manual (`m`), en cambio, Ctrl+C es el flujo esperado: corta el teleop y vuelve al prompt en `PAUSADO`.
 
 ## Qué falta (conocido, no implementado todavía)
 
-- **Waypoints hardcodeados** en `PatrolNode.__init__` (10 poses fijas) — deberían venir de un archivo YAML de rondas (waypoints, acciones por punto, agenda), para no tener que tocar código para cambiar un recorrido.
+- **Sin acciones por punto ni agenda/horario** en el YAML de waypoints.
 - **Sin persistencia a disco** del estado — no sobrevive un reinicio del nodo.
 - **Sin integración con twist_mux** (prioridades e-stop > teleoperación > navegación).
 - **Sin registro de ejecuciones** ("libro de rondas digital": inicio, waypoints con timestamp, interrupciones, resultado).
