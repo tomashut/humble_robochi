@@ -45,6 +45,27 @@ ros2 launch patrol_fsm patrol.launch.py
 
 Abre una terminal xterm con el cliente interactivo. Para usar un YAML de waypoints distinto (pensado para cuando haya más de un robot/instalación): `ros2 launch patrol_fsm patrol.launch.py waypoints_file:=/ruta/a/otro.yaml`.
 
+## Registro de ejecuciones ("libro de rondas digital")
+
+El nodo escribe un JSON Lines por día (`rounds_log_dir`, default `~/.local/share/patrol_fsm/rondas/AAAA-MM-DD.jsonl`) con un evento por línea. Cada línea tiene `ts` (timestamp con huso horario), `round_id` y `event`, más campos propios de ese evento:
+
+| Evento | Cuándo | Campos extra |
+|---|---|---|
+| `round_started` | Se abre una ronda (`start_patrol` desde `EN_BASE`, o automáticamente al cerrar el círculo del recorrido). | — |
+| `waypoint_reached` | El robot llega a un waypoint navegando en `EN_RONDA`. | `waypoint_name` |
+| `interrupted` | `pause_patrol`, `manual_start` o `return_to_base`. | `reason` (`pausado`/`manual`/`retorno_a_base`) |
+| `resumed` | `resume_patrol`. | — |
+| `goal_failed` | Cada intento fallido de Nav2 (rechazado, abortado, cancelado sin pedirlo). | `reason`, `fail_count` |
+| `round_ended` | Se cierra la ronda. | `result`: `completada` (dio la vuelta completa al circuito y arranca otra al toque), `retorno_a_base` (se cortó por un `return_to_base` exitoso), o `falla` (llegó a `FALLA`). |
+| `falla_reconocida` | `clear_failure`. | — |
+
+**Qué define una "ronda":** una vuelta completa al circuito de waypoints (del primero al último y de nuevo al principio), no un día completo de patrullaje (eso es la "sesión" = el archivo diario, que puede contener muchas rondas). Pausas y modo manual son interrupciones dentro de la misma ronda; un `return_to_base` exitoso, en cambio, la cierra — porque puede quedarse ahí un tiempo indefinido (cargando) y no queremos una ronda "abierta" cruzando archivos de varios días.
+
+Para leer: es texto plano, una línea por evento — alcanza con `jq` mientras no haya un panel:
+```bash
+jq 'select(.round_id == "20260807-143210123")' rondas/2026-08-07.jsonl
+```
+
 ## Comportamientos no obvios (aprendidos probando en simulación)
 
 - **`start_patrol` y `resume_patrol` no "arrancan de cero"**: `current_goal` (el índice del waypoint pendiente) solo avanza cuando se completa un waypoint estando en `EN_RONDA`. Ni `return_to_base` ni `clear_failure` lo resetean. Entonces si mandás el robot a la base a mitad de ronda (`b`) y después arrancás de nuevo (`s`), retoma en el waypoint donde había quedado, no en el 0. Es el comportamiento buscado (no repetir lo ya recorrido), pero el nombre `start_patrol` puede confundir.
@@ -54,7 +75,6 @@ Abre una terminal xterm con el cliente interactivo. Para usar un YAML de waypoin
 ## Qué falta (conocido, no implementado todavía)
 
 - **Sin acciones por punto ni agenda/horario** en el YAML de waypoints.
-- **Sin persistencia a disco** del estado — no sobrevive un reinicio del nodo.
+- **Sin persistencia a disco** del estado de la máquina de estados (el registro de ejecuciones sí persiste, pero el estado actual del nodo no sobrevive un reinicio).
 - **Sin integración con twist_mux** (prioridades e-stop > teleoperación > navegación).
-- **Sin registro de ejecuciones** ("libro de rondas digital": inicio, waypoints con timestamp, interrupciones, resultado).
 - **Sin disparo automático de retorno a base** por batería baja — `return_to_base` es siempre manual.

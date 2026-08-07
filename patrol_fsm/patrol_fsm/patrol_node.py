@@ -1,3 +1,5 @@
+import json
+from datetime import date, datetime
 from enum import Enum
 from pathlib import Path
 
@@ -41,6 +43,13 @@ class PatrolNode(Node):
         waypoints_file = self.get_parameter('waypoints_file').get_parameter_value().string_value
         self.waypoints = self.load_waypoints(waypoints_file)
 
+        default_rounds_log_dir = str(Path.home() / '.local' / 'share' / 'patrol_fsm' / 'rondas')
+        self.declare_parameter('rounds_log_dir', default_rounds_log_dir)
+        rounds_log_dir = self.get_parameter('rounds_log_dir').get_parameter_value().string_value
+        self.rounds_log_dir = Path(rounds_log_dir).expanduser()
+        self.rounds_log_dir.mkdir(parents=True, exist_ok=True)
+        self.round_id = None
+
         self.current_goal = 0
         self.fail_count = 0
         self._current_goal_handle = None
@@ -78,6 +87,7 @@ class PatrolNode(Node):
         if not waypoints:
             raise ValueError(f'{waypoints_file} no define ningun waypoint.')
 
+        self.waypoint_names = [wp['name'] for wp in waypoints]
         return [
             self.create_pose(wp['x'], wp['y'], wp['yaw'])
             for wp in waypoints
@@ -112,6 +122,27 @@ class PatrolNode(Node):
     def _fire_once(self, timer, fn):
         timer.cancel()
         fn()
+
+    # -- registro de rondas ("libro de rondas digital") -----------------------
+
+    def _log_event(self, event, **fields):
+        entry = {
+            'ts': datetime.now().astimezone().isoformat(timespec='seconds'),
+            'round_id': self.round_id,
+            'event': event,
+        }
+        entry.update(fields)
+
+        log_path = self.rounds_log_dir / f'{date.today().isoformat()}.jsonl'
+        with open(log_path, 'a') as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+
+    def _start_round(self):
+        self.round_id = datetime.now().strftime('%Y%m%d-%H%M%S%f')[:-3]
+        self._log_event('round_started')
+
+    def _end_round(self, result):
+        self._log_event('round_ended', result=result)
 
     # -- envío de goals -------------------------------------------------------
 
@@ -157,10 +188,15 @@ class PatrolNode(Node):
             self.fail_count = 0
             if self.state == PatrolState.RETORNO:
                 self.get_logger().info('Base alcanzada.')
+                self._end_round('retorno_a_base')
                 self._enter_state(PatrolState.EN_BASE)
             elif self.state == PatrolState.EN_RONDA:
                 self.get_logger().info(f'Waypoint #{self.current_goal + 1} alcanzado.')
+                self._log_event('waypoint_reached', waypoint_name=self.waypoint_names[self.current_goal])
                 self.current_goal = (self.current_goal + 1) % len(self.waypoints)
+                if self.current_goal == 0:
+                    self._end_round('completada')
+                    self._start_round()
                 self._call_later(self.NEXT_WAYPOINT_DELAY_SEC, self.send_next_goal)
 
         elif status == GoalStatus.STATUS_CANCELED:
@@ -179,8 +215,10 @@ class PatrolNode(Node):
     def _register_failure(self, reason):
         self.fail_count += 1
         self.get_logger().error(f'{reason} (fallo {self.fail_count}/{self.MAX_RETRIES})')
+        self._log_event('goal_failed', reason=reason, fail_count=self.fail_count)
 
         if self.fail_count >= self.MAX_RETRIES:
+            self._end_round('falla')
             self._enter_state(PatrolState.FALLA)
             self.get_logger().error(
                 'Máximo de reintentos alcanzado. Robot detenido, esperando /clear_failure.')
@@ -201,6 +239,7 @@ class PatrolNode(Node):
             return response
 
         self._enter_state(PatrolState.EN_RONDA)
+        self._start_round()
         self.send_next_goal()
         response.success = True
         response.message = 'Ronda iniciada.'
@@ -214,6 +253,7 @@ class PatrolNode(Node):
 
         self._enter_state(PatrolState.PAUSADO)
         self._cancel_active_goal()
+        self._log_event('interrupted', reason='pausado')
         response.success = True
         response.message = 'Ronda pausada.'
         return response
@@ -225,6 +265,7 @@ class PatrolNode(Node):
             return response
 
         self._enter_state(PatrolState.EN_RONDA)
+        self._log_event('resumed')
         self.send_next_goal()
         response.success = True
         response.message = 'Ronda reanudada.'
@@ -238,6 +279,7 @@ class PatrolNode(Node):
 
         self._enter_state(PatrolState.MANUAL)
         self._cancel_active_goal()
+        self._log_event('interrupted', reason='manual')
         response.success = True
         response.message = 'Control manual activado.'
         return response
@@ -261,6 +303,7 @@ class PatrolNode(Node):
 
         self._enter_state(PatrolState.RETORNO)
         self._cancel_active_goal()
+        self._log_event('interrupted', reason='retorno_a_base')
         self._call_later(self.NEXT_WAYPOINT_DELAY_SEC, self.send_next_goal)
         response.success = True
         response.message = 'Retornando a base.'
@@ -273,6 +316,7 @@ class PatrolNode(Node):
             return response
 
         self.fail_count = 0
+        self._log_event('falla_reconocida')
         self._enter_state(PatrolState.EN_BASE)
         response.success = True
         response.message = 'Falla reconocida. Pedí /start_patrol para reanudar la ronda.'
