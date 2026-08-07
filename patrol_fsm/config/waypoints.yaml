@@ -1,0 +1,42 @@
+# Waypoints de la ronda. El primero es la base (usado por RETORNO).
+waypoints:
+  - name: base
+    x: 0.0
+    y: 0.0
+    yaw: 0.0
+  - name: wp1
+    x: 6.910
+    y: 6.125
+    yaw: 0.0
+  - name: wp2
+    x: 10.801
+    y: 4.965
+    yaw: -1.476
+  - name: wp3
+    x: 14.693
+    y: 1.859
+    yaw: 1.310
+  - name: wp4
+    x: 18.810
+    y: 7.585
+    yaw: -1.450
+  - name: wp5
+    x: 21.317
+    y: -2.519
+    yaw: 3.117
+  - name: wp6
+    x: 14.331
+    y: -2.313
+    yaw: 3.142
+  - name: wp7
+    x: 11.887
+    y: -2.482
+    yaw: 3.102
+  - name: wp8
+    x: 8.706
+    y: -2.407
+    yaw: 3.142
+  - name: wp9
+    x: 2.531
+    y: -3.193
+    yaw: 1.773

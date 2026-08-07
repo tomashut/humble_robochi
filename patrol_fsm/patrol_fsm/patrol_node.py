@@ -1,4 +1,7 @@
 from enum import Enum
+from pathlib import Path
+
+import yaml
 
 import rclpy
 from rclpy.node import Node
@@ -6,6 +9,7 @@ from rclpy.action import ActionClient
 from rclpy.qos import QoSProfile, QoSDurabilityPolicy
 
 from action_msgs.msg import GoalStatus
+from ament_index_python.packages import get_package_share_directory
 from geometry_msgs.msg import PoseStamped
 from nav2_msgs.action import NavigateToPose
 from std_msgs.msg import String
@@ -31,18 +35,11 @@ class PatrolNode(Node):
     def __init__(self):
         super().__init__('patrol_node')
 
-        self.waypoints = [
-            self.create_pose(0.0, 0.0, 0.0),
-            self.create_pose(6.910, 6.125, 0.0),
-            self.create_pose(10.801, 4.965, -1.476),
-            self.create_pose(14.693, 1.859, 1.310),
-            self.create_pose(18.810, 7.585, -1.450),
-            self.create_pose(21.317, -2.519, 3.117),
-            self.create_pose(14.331, -2.313, 3.142),
-            self.create_pose(11.887, -2.482, 3.102),
-            self.create_pose(8.706, -2.407, 3.142),
-            self.create_pose(2.531, -3.193, 1.773),
-        ]
+        default_waypoints_file = str(
+            Path(get_package_share_directory('patrol_fsm')) / 'config' / 'waypoints.yaml')
+        self.declare_parameter('waypoints_file', default_waypoints_file)
+        waypoints_file = self.get_parameter('waypoints_file').get_parameter_value().string_value
+        self.waypoints = self.load_waypoints(waypoints_file)
 
         self.current_goal = 0
         self.fail_count = 0
@@ -71,6 +68,20 @@ class PatrolNode(Node):
         self._enter_state(PatrolState.EN_BASE)
 
     # -- utilidades de pose -------------------------------------------------
+
+    def load_waypoints(self, waypoints_file):
+        self.get_logger().info(f'Cargando waypoints desde {waypoints_file}')
+        with open(waypoints_file) as f:
+            data = yaml.safe_load(f)
+
+        waypoints = data['waypoints']
+        if not waypoints:
+            raise ValueError(f'{waypoints_file} no define ningun waypoint.')
+
+        return [
+            self.create_pose(wp['x'], wp['y'], wp['yaw'])
+            for wp in waypoints
+        ]
 
     def create_pose(self, x, y, yaw):
         pose = PoseStamped()
