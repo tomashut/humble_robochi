@@ -94,5 +94,17 @@ Si Nav2 vuelve a fallar tras la auto-reanudación, cae en el mismo camino de rei
 ## Qué falta (conocido, no implementado todavía)
 
 - **Sin acciones por punto ni agenda/horario** en el YAML de waypoints.
-- **Sin integración con twist_mux** (prioridades e-stop > teleoperación > navegación).
 - **Sin disparo automático de retorno a base** por batería baja — `return_to_base` es siempre manual.
+
+### Sin integración con twist_mux (prioridades e-stop > teleoperación > navegación) — investigado, no implementado
+
+Hoy Nav2 y el teleop (`teleop_twist_keyboard`) escriben los dos al **mismo tópico** `cmd_vel`, sin ningún árbitro — el bridge de Gazebo recibe los mensajes de ambos mezclados, sin poder distinguir de dónde vino cada uno. `twist_mux` es la pieza estándar de ROS 2 para resolver esto (prioridades + timeout tipo dead-man por fuente + un "lock" separado para e-stop, que es justo el mecanismo correcto para eso — corta todo sin pasar por la lógica de prioridades normal).
+
+**Por qué no está hecho todavía:** para que `twist_mux` realmente controle el robot (no solo decida "en el aire" sin que nadie lo escuche), hace falta que el consumidor final del `cmd_vel` deje de escuchar la salida cruda de Nav2 y pase a escuchar la salida ya arbitrada de `twist_mux`. En simulación, ese consumidor final es el bridge de Gazebo — y la línea que lo conecta está en `andino_gz/config/bridge_config.yaml`, **adentro del submódulo git `andino_gz`**, sin ningún argumento de launch para pasarle una ruta alternativa (a diferencia de `world_name`/`map`/`params_file`, que sí son parametrizables). El remapeo final de Nav2 hacia `cmd_vel` tampoco es tocable desde afuera: está hardcodeado adentro del propio paquete de sistema `nav2_bringup`, no es configuración de `andino_gz`.
+
+**Riesgo de la solución (editar una línea de `bridge_config.yaml`):**
+- Es una modificación local a un archivo trackeado dentro de un submódulo de terceros — diverge del repo original (`github.com/ekumenlabs/andino_gz`).
+- Si algún día se actualiza el submódulo (`git submodule update`), esa línea se puede pisar o entrar en conflicto, y si nadie se acuerda de reaplicarla, `twist_mux` queda armado pero sin efecto — Nav2 y teleop vuelven a chocar sin arbitrar en `cmd_vel`, **en silencio, sin ningún error que lo avise**. Hay que tenerlo presente como checklist post-actualización del submódulo si esto se implementa.
+- No es lógica de Nav2/AMCL/slam_toolbox/ros2_control (que es lo que el CLAUDE.md dice no reescribir) — es una tabla de nombres de tópicos específica de la simulación en Gazebo, sin ningún equivalente en el robot físico.
+
+**Alcance:** esto es 100% específico de la simulación. En el robot físico, el "último cable" hacia los motores reales sería otro mecanismo (`ros2_control` con el driver real), que hoy no existe en este repo — habrá que resolver el mismo problema ahí, por separado, cuando llegue ese momento. La config de `twist_mux` en sí (prioridades, timeouts, e-stop como lock) sí se porta sin cambios entre simulación, Andino físico, y el rover propio a futuro.
