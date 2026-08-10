@@ -1,8 +1,12 @@
+import json
+import math
+
 import paho.mqtt.client as mqtt
 
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSDurabilityPolicy
+from geometry_msgs.msg import PoseWithCovarianceStamped
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 
@@ -40,6 +44,7 @@ class CommsAgentNode(Node):
         self.cmd_topic = f'{base_topic}/cmd'
         self.state_topic = f'{base_topic}/state'
         self.heartbeat_topic = f'{base_topic}/heartbeat'
+        self.position_topic = f'{base_topic}/position'
 
         self._service_clients = {
             command: self.create_client(Trigger, service_name)
@@ -48,6 +53,7 @@ class CommsAgentNode(Node):
 
         state_qos = QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
         self.create_subscription(String, 'patrol_state', self._on_patrol_state, state_qos)
+        self.create_subscription(PoseWithCovarianceStamped, 'amcl_pose', self._on_amcl_pose, 10)
 
         self._mqtt = mqtt.Client()
         self._mqtt.on_connect = self._on_mqtt_connect
@@ -61,7 +67,8 @@ class CommsAgentNode(Node):
         self.get_logger().info(
             f'Agente listo. Comandos en "{self.cmd_topic}" '
             f'({"/".join(COMMAND_TO_SERVICE.keys())}). '
-            f'Estado en "{self.state_topic}". Heartbeat en "{self.heartbeat_topic}".')
+            f'Estado en "{self.state_topic}". Heartbeat en "{self.heartbeat_topic}". '
+            f'Posicion en "{self.position_topic}".')
 
     # -- MQTT -> ROS --------------------------------------------------------
 
@@ -96,6 +103,13 @@ class CommsAgentNode(Node):
 
     def _on_patrol_state(self, msg):
         self._mqtt.publish(self.state_topic, msg.data, qos=0, retain=True)
+
+    def _on_amcl_pose(self, msg):
+        position = msg.pose.pose.position
+        orientation = msg.pose.pose.orientation
+        yaw = 2 * math.atan2(orientation.z, orientation.w)
+        payload = json.dumps({'x': position.x, 'y': position.y, 'yaw': yaw})
+        self._mqtt.publish(self.position_topic, payload, qos=0, retain=True)
 
     def _publish_heartbeat(self):
         now = self.get_clock().now().to_msg()

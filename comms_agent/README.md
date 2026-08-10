@@ -22,7 +22,7 @@ Tópicos MQTT, con el patrón `patrol/<installation_id>/<robot_id>/...` (paráme
 
 MQTT en sí no valida nada — no tiene el concepto de "comando válido". Toda la validación de qué es un comando conocido vive en este nodo (`comms_agent`), no en Mosquitto ni en herramientas como `mosquitto_pub`.
 
-Sin VPN todavía — Mosquitto corre local (`127.0.0.1:1883`), solo acepta conexiones de esta misma máquina. La capa de WireGuard es trabajo futuro, para cuando haya que exponerlo hacia afuera de verdad.
+Sin VPN todavía — el listener MQTT normal corre local (`127.0.0.1:1883`), solo acepta conexiones de esta misma máquina. El listener de WebSocket para el panel (puerto 9001) *debería* tener la misma restricción pero no la respeta — ver bug documentado más abajo. La capa de WireGuard es trabajo futuro, para cuando haya que exponerlo hacia afuera de verdad.
 
 ## Cómo correrlo
 
@@ -55,7 +55,8 @@ mosquitto_pub -t patrol/default/andino/cmd -m start
 
 ## Qué falta (conocido, no implementado todavía)
 
-- **Sin VPN (WireGuard)** — Mosquitto solo escucha en localhost, no hay capa de seguridad de red todavía.
+- **Sin VPN (WireGuard)** — no hay capa de seguridad de red todavía.
 - **Sin heartbeat/telemetría del lado "detectar robot caído"** — hoy se publica el heartbeat, pero nada consume/vigila que deje de llegar.
 - **Sin autenticación/TLS en MQTT** — Mosquitto corre con la config default, sin usuario/contraseña ni certificados.
 - **Comandos como texto plano, no JSON** — suficiente para el hito minimo; si en el futuro los comandos necesitan parámetros (por ejemplo, elegir qué ronda correr), va a hacer falta un formato más rico.
+- **Bug conocido, no resuelto: el listener de WebSocket (puerto 9001, agregado para el panel v0) no respeta `bind_address`/`listener <puerto> 127.0.0.1`** — a diferencia del listener MQTT normal (puerto 1883), que sí quedó correctamente restringido a `localhost`. Probamos dos sintaxis de configuración distintas (`listener 9001 127.0.0.1` y `bind_address 127.0.0.1` como directiva separada, esta segunda ademas rota porque `bind_address` es una opcion de listener "default" unica, no se puede repetir por listener) y en ambos casos el puerto 9001 sigue escuchando en todas las interfaces de red (`ss -tln` muestra `*:9001` en vez de `127.0.0.1:9001`). Parece una limitación real de Mosquitto 2.0.11 (la version que instala `apt` en Ubuntu 22.04) con el listener de WebSockets especificamente, no un error de configuración nuestro. **Riesgo real hoy:** cualquier dispositivo en la misma red local (WiFi/cable) podria conectarse al panel via MQTT-sobre-WebSocket, no solo esta maquina — acotado (no es exposicion a internet), pero real. Sin resolver todavia; posibles mitigaciones futuras: regla de firewall (`ufw`) bloqueando el puerto 9001 desde otras interfaces, actualizar Mosquitto a una version mas nueva, o resolverlo cuando se implemente la capa de VPN/autenticacion real.

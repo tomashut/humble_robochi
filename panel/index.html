@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>Panel patrol_fsm (v0)</title>
+<script src="mqtt.min.js"></script>
+<style>
+  body { font-family: sans-serif; background: #1e1e1e; color: #eee; margin: 0; padding: 20px; }
+  h1 { font-size: 1.2rem; font-weight: normal; color: #999; }
+  #layout { display: flex; gap: 24px; align-items: flex-start; flex-wrap: wrap; }
+  canvas { border: 1px solid #444; background: #000; image-rendering: pixelated; }
+  #panel { min-width: 220px; }
+  #estado { font-size: 1.4rem; font-weight: bold; padding: 10px; border-radius: 6px; margin-bottom: 12px; text-align: center; }
+  .estado-EN_BASE { background: #333; color: #ccc; }
+  .estado-EN_RONDA { background: #1b5e20; color: #fff; }
+  .estado-PAUSADO { background: #8a6d00; color: #fff; }
+  .estado-MANUAL { background: #01579b; color: #fff; }
+  .estado-RETORNO { background: #4a148c; color: #fff; }
+  .estado-FALLA { background: #b71c1c; color: #fff; }
+  .estado-desconocido { background: #000; color: #666; border: 1px dashed #444; }
+  button { display: block; width: 100%; margin-bottom: 8px; padding: 10px; font-size: 1rem;
+           background: #333; color: #eee; border: 1px solid #555; border-radius: 4px; cursor: pointer; }
+  button:hover:not(:disabled) { background: #444; }
+  button:disabled { opacity: 0.35; cursor: not-allowed; }
+  #conexion { font-size: 0.85rem; color: #888; margin-top: 16px; }
+  #conexion .ok { color: #4caf50; }
+  #conexion .mal { color: #f44336; }
+</style>
+</head>
+<body>
+  <h1>patrol_fsm — panel v0 (mapa: depot)</h1>
+  <div id="layout">
+    <canvas id="mapa" width="1210" height="618"></canvas>
+    <div id="panel">
+      <div id="estado" class="estado-desconocido">sin datos</div>
+      <button id="btn-start">Iniciar ronda</button>
+      <button id="btn-pause">Pausar</button>
+      <button id="btn-resume">Reanudar</button>
+      <button id="btn-return">Retornar a base</button>
+      <button id="btn-clear">Limpiar falla</button>
+      <div id="conexion">conectando a MQTT...</div>
+    </div>
+  </div>
+
+<script>
+// -- config especifica de esta instalacion/robot/mapa (hardcodeado para v0) --
+const INSTALLATION_ID = 'default';
+const ROBOT_ID = 'andino';
+const MQTT_URL = 'ws://localhost:9001';
+
+// depot.yaml: resolution 0.05 m/px, origin [-7.99, -6.67, 0], imagen 605x309 px
+const MAP_RESOLUTION = 0.05;
+const MAP_ORIGIN_X = -7.99;
+const MAP_ORIGIN_Y = -6.67;
+const MAP_IMG_W = 605;
+const MAP_IMG_H = 309;
+const SCALE = 2; // el canvas se dibuja al doble para que se vea mejor
+
+const base = `patrol/${INSTALLATION_ID}/${ROBOT_ID}`;
+
+// -- mapa + posicion --
+const canvas = document.getElementById('mapa');
+const ctx = canvas.getContext('2d');
+const mapImg = new Image();
+mapImg.src = 'depot.png';
+let lastPos = null; // {x, y, yaw}
+
+function mapToPixel(x, y) {
+  const px = (x - MAP_ORIGIN_X) / MAP_RESOLUTION;
+  const pyFromBottom = (y - MAP_ORIGIN_Y) / MAP_RESOLUTION;
+  const py = MAP_IMG_H - pyFromBottom;
+  return [px * SCALE, py * SCALE];
+}
+
+function draw() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(mapImg, 0, 0, MAP_IMG_W * SCALE, MAP_IMG_H * SCALE);
+  if (lastPos) {
+    const [px, py] = mapToPixel(lastPos.x, lastPos.y);
+    ctx.beginPath();
+    ctx.arc(px, py, 8, 0, 2 * Math.PI);
+    ctx.fillStyle = '#ff3b30';
+    ctx.fill();
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    // linea corta indicando orientacion (yaw)
+    const len = 18;
+    ctx.beginPath();
+    ctx.moveTo(px, py);
+    ctx.lineTo(px + len * Math.cos(lastPos.yaw), py - len * Math.sin(lastPos.yaw));
+    ctx.strokeStyle = '#ff3b30';
+    ctx.lineWidth = 3;
+    ctx.stroke();
+  }
+}
+mapImg.onload = draw;
+
+// -- estado + botones --
+const estadoDiv = document.getElementById('estado');
+const buttons = {
+  start: document.getElementById('btn-start'),
+  pause: document.getElementById('btn-pause'),
+  resume: document.getElementById('btn-resume'),
+  return_to_base: document.getElementById('btn-return'),
+  clear_failure: document.getElementById('btn-clear'),
+};
+
+// que botones tienen sentido segun el estado actual (misma tabla que patrol_fsm/README.md)
+const ENABLED_BY_STATE = {
+  EN_BASE:  ['start'],
+  EN_RONDA: ['pause', 'return_to_base'],
+  PAUSADO:  ['resume', 'return_to_base'],
+  MANUAL:   [],
+  RETORNO:  [],
+  FALLA:    ['clear_failure'],
+};
+
+function setEstado(estado) {
+  estadoDiv.textContent = estado;
+  estadoDiv.className = 'estado-' + estado;
+  const enabled = ENABLED_BY_STATE[estado] || [];
+  for (const [cmd, btn] of Object.entries(buttons)) {
+    btn.disabled = !enabled.includes(cmd);
+  }
+}
+
+// -- MQTT --
+const conexionDiv = document.getElementById('conexion');
+const client = mqtt.connect(MQTT_URL);
+
+client.on('connect', () => {
+  conexionDiv.innerHTML = '<span class="ok">conectado a Mosquitto</span>';
+  client.subscribe(`${base}/state`);
+  client.subscribe(`${base}/position`);
+  client.subscribe(`${base}/heartbeat`);
+});
+
+client.on('error', (err) => {
+  conexionDiv.innerHTML = `<span class="mal">error MQTT: ${err.message}</span>`;
+});
+
+client.on('close', () => {
+  conexionDiv.innerHTML = '<span class="mal">desconectado</span>';
+});
+
+let lastHeartbeat = 0;
+
+client.on('message', (topic, payload) => {
+  const msg = payload.toString();
+  if (topic === `${base}/state`) {
+    setEstado(msg);
+  } else if (topic === `${base}/position`) {
+    try {
+      lastPos = JSON.parse(msg);
+      draw();
+    } catch (e) {
+      console.warn('posicion invalida:', msg);
+    }
+  } else if (topic === `${base}/heartbeat`) {
+    lastHeartbeat = Date.now();
+  }
+});
+
+setInterval(() => {
+  if (lastHeartbeat === 0) return;
+  const segundos = (Date.now() - lastHeartbeat) / 1000;
+  if (segundos > 15) {
+    conexionDiv.innerHTML = `<span class="mal">sin heartbeat hace ${segundos.toFixed(0)}s — robot caido?</span>`;
+  }
+}, 3000);
+
+for (const [cmd, btn] of Object.entries(buttons)) {
+  btn.addEventListener('click', () => client.publish(`${base}/cmd`, cmd));
+}
+</script>
+</body>
+</html>
