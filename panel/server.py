@@ -131,6 +131,14 @@ async def handle_ws(request):
     await ws.prepare(request)
     request.app['websockets'].add(ws)
     mqtt_client = request.app['mqtt_client']
+
+    # al conectar, mandar lo ultimo conocido -- si no, un navegador que se
+    # conecta despues de que el estado ya se publico se queda sin saber
+    # nada hasta el proximo cambio (que puede tardar mucho en llegar).
+    for cached in request.app['last_known'].values():
+        if cached is not None:
+            await ws.send_str(cached)
+
     try:
         async for msg in ws:
             if msg.type != WSMsgType.TEXT:
@@ -171,14 +179,18 @@ def make_mqtt_client(app, loop, host, port, username, password):
 
     def on_message(c, userdata, msg):
         if msg.topic == STATE_TOPIC:
+            key = 'state'
             out = {'type': 'state', 'data': msg.payload.decode('utf-8')}
         elif msg.topic == POSITION_TOPIC:
+            key = 'position'
             out = {'type': 'position', 'data': json.loads(msg.payload.decode('utf-8'))}
         elif msg.topic == HEARTBEAT_TOPIC:
+            key = 'heartbeat'
             out = {'type': 'heartbeat', 'data': None}
         else:
             return
         text = json.dumps(out)
+        app['last_known'][key] = text
         for ws in list(app['websockets']):
             asyncio.run_coroutine_threadsafe(_safe_send(ws, text), loop)
 
@@ -192,6 +204,7 @@ def make_mqtt_client(app, loop, host, port, username, password):
 def create_app(mqtt_host, mqtt_port, mqtt_username, mqtt_password):
     app = web.Application()
     app['websockets'] = set()
+    app['last_known'] = {'state': None, 'position': None, 'heartbeat': None}
 
     app.router.add_get('/login', handle_login_page)
     app.router.add_post('/login', handle_login_post)
