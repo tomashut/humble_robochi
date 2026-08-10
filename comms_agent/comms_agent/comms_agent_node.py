@@ -29,12 +29,16 @@ class CommsAgentNode(Node):
 
         self.declare_parameter('mqtt_host', 'localhost')
         self.declare_parameter('mqtt_port', 1883)
+        self.declare_parameter('mqtt_username', '')
+        self.declare_parameter('mqtt_password', '')
         self.declare_parameter('installation_id', 'default')
         self.declare_parameter('robot_id', 'andino')
         self.declare_parameter('heartbeat_interval_sec', 5.0)
 
         mqtt_host = self.get_parameter('mqtt_host').get_parameter_value().string_value
         mqtt_port = self.get_parameter('mqtt_port').get_parameter_value().integer_value
+        mqtt_username = self.get_parameter('mqtt_username').get_parameter_value().string_value
+        mqtt_password = self.get_parameter('mqtt_password').get_parameter_value().string_value
         installation_id = self.get_parameter('installation_id').get_parameter_value().string_value
         robot_id = self.get_parameter('robot_id').get_parameter_value().string_value
         heartbeat_interval_sec = (
@@ -56,6 +60,8 @@ class CommsAgentNode(Node):
         self.create_subscription(PoseWithCovarianceStamped, 'amcl_pose', self._on_amcl_pose, 10)
 
         self._mqtt = mqtt.Client()
+        if mqtt_username:
+            self._mqtt.username_pw_set(mqtt_username, mqtt_password)
         self._mqtt.on_connect = self._on_mqtt_connect
         self._mqtt.on_message = self._on_mqtt_message
         self.get_logger().info(f'Conectando a Mosquitto en {mqtt_host}:{mqtt_port}...')

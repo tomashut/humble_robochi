@@ -33,11 +33,11 @@
     <canvas id="mapa" width="1210" height="618"></canvas>
     <div id="panel">
       <div id="estado" class="estado-desconocido">sin datos</div>
-      <button id="btn-start">Iniciar ronda</button>
-      <button id="btn-pause">Pausar</button>
-      <button id="btn-resume">Reanudar</button>
-      <button id="btn-return">Retornar a base</button>
-      <button id="btn-clear">Limpiar falla</button>
+      <button id="btn-start" disabled>Iniciar ronda</button>
+      <button id="btn-pause" disabled>Pausar</button>
+      <button id="btn-resume" disabled>Reanudar</button>
+      <button id="btn-return" disabled>Retornar a base</button>
+      <button id="btn-clear" disabled>Limpiar falla</button>
       <div id="conexion">conectando a MQTT...</div>
     </div>
   </div>
@@ -47,6 +47,11 @@
 const INSTALLATION_ID = 'default';
 const ROBOT_ID = 'andino';
 const MQTT_URL = 'ws://localhost:9001';
+// ojo: esto viaja en el HTML/JS que le llega al navegador, cualquiera que vea el
+// codigo fuente de la pagina lo ve. Es autenticacion basica (evita conexiones
+// anonimas casuales), no un secreto real -- ver panel/README.md.
+const MQTT_USERNAME = 'andino';
+const MQTT_PASSWORD = 'patrol_2026';
 
 // depot.yaml: resolution 0.05 m/px, origin [-7.99, -6.67, 0], imagen 605x309 px
 const MAP_RESOLUTION = 0.05;
@@ -127,11 +132,41 @@ function setEstado(estado) {
 }
 
 // -- MQTT --
+// OJO: "conectado a Mosquitto" NO significa "el robot esta prendido" -- Mosquitto
+// es un servicio aparte que corre solo, sin importar si patrol_node/comms_agent
+// estan corriendo. Por eso se trackea por separado si alguna vez llego una senal
+// real del robot (state o heartbeat), y los botones quedan deshabilitados hasta
+// que eso pase.
 const conexionDiv = document.getElementById('conexion');
-const client = mqtt.connect(MQTT_URL);
+const client = mqtt.connect(MQTT_URL, {
+  username: MQTT_USERNAME,
+  password: MQTT_PASSWORD,
+});
+
+let brokerConectado = false;
+let ultimaSenalRobot = 0; // timestamp del ultimo state O heartbeat recibido (lo que sea)
+
+function actualizarIndicadorConexion() {
+  if (!brokerConectado) {
+    conexionDiv.innerHTML = '<span class="mal">conectando a Mosquitto...</span>';
+    return;
+  }
+  if (ultimaSenalRobot === 0) {
+    conexionDiv.innerHTML = '<span class="mal">conectado a Mosquitto, pero sin señal del robot ' +
+      '— ¿patrol_node/comms_agent están corriendo?</span>';
+    return;
+  }
+  const segundos = (Date.now() - ultimaSenalRobot) / 1000;
+  if (segundos > 15) {
+    conexionDiv.innerHTML = `<span class="mal">sin señal del robot hace ${segundos.toFixed(0)}s — ¿se cayó?</span>`;
+  } else {
+    conexionDiv.innerHTML = '<span class="ok">conectado, robot activo</span>';
+  }
+}
 
 client.on('connect', () => {
-  conexionDiv.innerHTML = '<span class="ok">conectado a Mosquitto</span>';
+  brokerConectado = true;
+  actualizarIndicadorConexion();
   client.subscribe(`${base}/state`);
   client.subscribe(`${base}/position`);
   client.subscribe(`${base}/heartbeat`);
@@ -142,14 +177,14 @@ client.on('error', (err) => {
 });
 
 client.on('close', () => {
-  conexionDiv.innerHTML = '<span class="mal">desconectado</span>';
+  brokerConectado = false;
+  conexionDiv.innerHTML = '<span class="mal">desconectado de Mosquitto</span>';
 });
-
-let lastHeartbeat = 0;
 
 client.on('message', (topic, payload) => {
   const msg = payload.toString();
   if (topic === `${base}/state`) {
+    ultimaSenalRobot = Date.now();
     setEstado(msg);
   } else if (topic === `${base}/position`) {
     try {
@@ -159,17 +194,11 @@ client.on('message', (topic, payload) => {
       console.warn('posicion invalida:', msg);
     }
   } else if (topic === `${base}/heartbeat`) {
-    lastHeartbeat = Date.now();
+    ultimaSenalRobot = Date.now();
   }
 });
 
-setInterval(() => {
-  if (lastHeartbeat === 0) return;
-  const segundos = (Date.now() - lastHeartbeat) / 1000;
-  if (segundos > 15) {
-    conexionDiv.innerHTML = `<span class="mal">sin heartbeat hace ${segundos.toFixed(0)}s — robot caido?</span>`;
-  }
-}, 3000);
+setInterval(actualizarIndicadorConexion, 3000);
 
 for (const [cmd, btn] of Object.entries(buttons)) {
   btn.addEventListener('click', () => client.publish(`${base}/cmd`, cmd));

@@ -9,3 +9,6 @@ __pycache__/
 
 # Editor
 .vscode/
+
+# Claude Code local config (agentes, etc.) -- se queda solo en esta PC
+.claude/
