@@ -46,7 +46,12 @@
 // -- config especifica de esta instalacion/robot/mapa (hardcodeado para v0) --
 const INSTALLATION_ID = 'default';
 const ROBOT_ID = 'andino';
-const MQTT_URL = 'ws://localhost:9001';
+// window.location.hostname es el host que el navegador uso para abrir esta
+// pagina -- si la abriste como file:// es vacio (cae a 'localhost'); si la
+// abriste desde otra PC como http://<ip-de-esta-maquina>:8080, es esa IP.
+// Asi el panel apunta solo al Mosquitto correcto, sin tocar codigo.
+const MQTT_HOST = window.location.hostname || 'localhost';
+const MQTT_URL = `ws://${MQTT_HOST}:9001`;
 // ojo: esto viaja en el HTML/JS que le llega al navegador, cualquiera que vea el
 // codigo fuente de la pagina lo ve. Es autenticacion basica (evita conexiones
 // anonimas casuales), no un secreto real -- ver panel/README.md.

@@ -20,10 +20,18 @@ Un solo archivo autocontenido (`index.html`), sin backend ni build — se abre d
 
 Requiere: `comms_agent` corriendo (ver su README), y Mosquitto con un listener de WebSocket habilitado (ver más abajo, no viene así por default).
 
+**Local, en esta misma máquina:**
 ```bash
 xdg-open /home/tomashut/humble_robochi/panel/index.html
 ```
 O abrir `file:///home/tomashut/humble_robochi/panel/index.html` directo desde el navegador.
+
+**Desde otro dispositivo en la misma red (celular, otra PC):** hace falta servir la carpeta por HTTP, no alcanza con `file://`. Con el servidor que trae Python de fábrica, sin instalar nada:
+```bash
+cd /home/tomashut/humble_robochi/panel
+python3 -m http.server 8080 --bind 0.0.0.0
+```
+Y desde el otro dispositivo, abrir `http://<IP-de-esta-maquina-en-la-red>:8080` (buscar la IP con `ip -4 addr show`, la de la interfaz de WiFi/cable real — no la de interfaces virtuales tipo `lxcbr0`/`docker0` si las hay). `MQTT_HOST` en el JS se calcula solo a partir de `window.location.hostname`, así que no hace falta editar nada a mano según desde dónde se abra. Esto **no es un servicio persistente** — es un comando que corre en primer plano mientras lo necesites, no arranca solo al reiniciar la máquina.
 
 ### Habilitar el listener de WebSocket + autenticación en Mosquitto (una sola vez)
 
@@ -55,6 +63,7 @@ sudo systemctl restart mosquitto
 - **Tampoco "hay señal del robot" significa "la simulación/Nav2 están operativos"** — `patrol_node` puede estar vivo y contestando (`patrol_state`) sin que Gazebo esté siquiera abierto. El panel no tiene forma de distinguir eso hoy; si mandás `start` en esa situación, `patrol_node` lo va a aceptar pero el goal a Nav2 va a fallar 5 veces y termina en `FALLA` (ver `patrol_fsm/README.md`).
 - **Al recargar la página, el cartel rojo ("sin señal del robot") aparece un instante antes de pasar a verde** — es esperado: `state` se publica con `retain=True`, así que Mosquitto lo entrega automáticamente al suscribirse, pero tarda una fracción de segundo. No es un bug, es el panel siendo honesto sobre lo que sabe en cada instante.
 - **La autenticación del panel es básica, no un secreto real** — usuario/contraseña quedan en texto plano dentro de `index.html`, visibles para cualquiera que abra el código fuente de la página. Sirve para filtrar conexiones anónimas casuales en la red local, no para proteger contra alguien que se tome el trabajo de mirar el HTML. Ver `comms_agent/README.md` para el detalle completo de la config de Mosquitto.
+- **Cargar el panel desde otro dispositivo no pide ningún login** — las credenciales de MQTT viajan adentro de la página y se mandan solas, sin preguntarle nada a quien la abre. O sea que cualquiera que llegue a la URL del panel (por ejemplo, otra persona en la misma red WiFi) entra igual que vos, sin que se le pida nada — confirmado probándolo desde un celular. La autenticación de Mosquitto protege contra alguien hablando MQTT crudo sin credenciales (`mosquitto_pub` a mano), no contra alguien que simplemente abre esta página.
 - `password_file` (y antes `allow_anonymous`, `bind_address`) son opciones que **Mosquitto solo permite declarar una vez, arriba de todo el archivo** — repetirlas dentro de cada bloque `listener` rompe el arranque con "Duplicate ... value in configuration". Aprendido a los golpes en varias vueltas de prueba y error.
 - **Bug sin resolver, documentado en `comms_agent/README.md`**: el listener 9001 (WebSocket) no respeta `bind_address`/`listener <puerto> 127.0.0.1` — queda escuchando en todas las interfaces de red, no solo `localhost`, a diferencia del 1883. Parece limitación de Mosquitto 2.0.11. Riesgo acotado a la red local, no a internet — aceptado por ahora en esta etapa de prototipo.
 - **`ros2 topic echo`/`comms_agent` pueden no ver una posición hasta que el robot se mueve**: AMCL no republica `/amcl_pose` a un ritmo fijo si el robot está quieto, solo en updates — si `comms_agent` arrancó después de setear la pose inicial en RViz, se puede perder esa primera publicación. Se resuelve solo apenas el robot arranca a moverse (`start`).
@@ -62,6 +71,7 @@ sudo systemctl restart mosquitto
 ## Qué falta (conocido, no implementado todavía)
 
 - **Todo hardcodeado a un solo robot/instalación/mapa** (`default`/`andino`/`depot`) — no hay selector ni configuración, coherente con el alcance "v0".
-- **Solo abrible localmente (`file://`)** — no hay ningún servidor sirviéndolo en la red, y `MQTT_URL` apunta a `localhost` — otra PC no puede usarlo todavía (pendiente, próximo paso).
+- **Sin servidor persistente** — servirlo en la red es un comando manual (`http.server`), no un servicio que arranca solo.
+- **Sin login humano real** — ver el punto de arriba sobre cargar el panel sin que pida nada.
 - **Sin teleoperación real** (WebRTC) — los botones de modo manual no están, a propósito (ver arriba).
 - **Sin manejo de reconexión visible más allá del indicador de conexión** — si se cae Mosquitto o `comms_agent`, el panel avisa pero no reintenta activamente ni reconstruye el estado más allá de lo que ofrece `mqtt.js` por default.
