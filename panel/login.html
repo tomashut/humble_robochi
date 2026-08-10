@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<title>Panel patrol_fsm — login</title>
+<style>
+  body { font-family: sans-serif; background: #1e1e1e; color: #eee; display: flex;
+         align-items: center; justify-content: center; height: 100vh; margin: 0; }
+  form { background: #2a2a2a; padding: 32px; border-radius: 8px; width: 260px; }
+  h1 { font-size: 1.1rem; font-weight: normal; color: #999; margin-top: 0; }
+  input { width: 100%; box-sizing: border-box; padding: 10px; margin-bottom: 12px;
+          background: #1e1e1e; border: 1px solid #555; border-radius: 4px; color: #eee; }
+  button { width: 100%; padding: 10px; background: #333; color: #eee; border: 1px solid #555;
+           border-radius: 4px; cursor: pointer; }
+  button:hover { background: #444; }
+  #error { color: #f44336; font-size: 0.85rem; margin-bottom: 12px; display: none; }
+</style>
+</head>
+<body>
+<form method="post" action="/login">
+  <h1>patrol_fsm — panel</h1>
+  <div id="error">Usuario o contraseña incorrectos.</div>
+  <input type="text" name="username" placeholder="Usuario" required autofocus>
+  <input type="password" name="password" placeholder="Contraseña" required>
+  <button type="submit">Entrar</button>
+</form>
+<script>
+  if (new URLSearchParams(window.location.search).get('error')) {
+    document.getElementById('error').style.display = 'block';
+  }
+</script>
+</body>
+</html>

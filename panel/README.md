@@ -1,77 +1,73 @@
 # panel
 
-Panel v0: página web mínima que habla MQTT directo desde el navegador (sin backend propio) contra el mismo Mosquitto que usa `comms_agent`. Es el punto 4 del plan del CLAUDE.md, en su versión más simple: mapa con posición en vivo, estado, botones.
+Panel v0: web con login humano real, mapa con posición en vivo, estado y botones para comandar `patrol_fsm`. Es el punto 4 del plan del CLAUDE.md.
 
 Este README describe el estado actual y se va a ir actualizando con cada push.
 
+## Arquitectura (cambió — ya no es solo un HTML suelto)
+
+Hasta la versión anterior, el navegador hablaba MQTT directo contra Mosquitto (MQTT sobre WebSocket), con la contraseña de Mosquitto adentro del JavaScript de la página. Eso permitía filtrar conexiones anónimas casuales, pero **no era un login real** — cualquiera que abriera la página se conectaba automáticamente, sin que se le pidiera nada, y la contraseña real de Mosquitto quedaba visible en el código fuente de cualquiera que la mirara.
+
+Ahora hay un **backend propio** (`server.py`, Python + `aiohttp`) que se para en el medio:
+
+```
+navegador  <--WebSocket propio, con login-->  server.py  <--MQTT (paho-mqtt)-->  Mosquitto  <-->  comms_agent  <-->  patrol_node
+```
+
+- El navegador **nunca ve la contraseña real de Mosquitto** — solo `server.py` la tiene, pasada por línea de comandos al arrancarlo (igual que se le pasa a `comms_agent`).
+- Para entrar hay que loguearse con usuario/contraseña de **persona** (gestionados por `manage_users.py`, guardados hasheados en `users.json`), completamente separados de las credenciales de Mosquitto.
+- Una vez logueado, el navegador habla con `server.py` por un WebSocket propio (JSON simple: `{"type": "state", "data": "EN_RONDA"}`, etc.), no por MQTT. `server.py` es el que efectivamente publica/suscribe a Mosquitto de un lado, y reenvía todo al navegador del otro.
+- `mqtt.js` ya no se usa (se borró `mqtt.min.js`) — el navegador usa el `WebSocket` nativo del navegador, no necesita ninguna librería.
+
+Analogía (la misma que fuimos usando para pensar esto): antes, el navegador era un huésped de hotel al que le dábamos una copia de la llave maestra para que entrara solo a cualquier puerta. Ahora el navegador le pide las cosas al recepcionista (`server.py`), y es el recepcionista el único que tiene la llave maestra y la usa por vos — si a un huésped le roban su credencial, no sirve para nada fuera de esta recepción.
+
 ## Qué hace hoy
 
-Un solo archivo autocontenido (`index.html`), sin backend ni build — se abre directo como `file://` en el navegador. Usa la librería `mqtt.js` (bundleada localmente en `mqtt.min.js`, no depende de internet) para hablar **MQTT sobre WebSocket** directo con Mosquitto (opción elegida en vez de escribir un backend propio — ver discusión en el historial del proyecto).
-
-- **Mapa**: `depot.png`, convertido una sola vez desde `src/andino_gz/andino_gz/maps/depot/depot.pgm` (formato que el navegador no puede mostrar directo). Es un archivo estático — no viaja por MQTT, se carga una vez.
-- **Posición en vivo**: se suscribe a `patrol/default/andino/position` (JSON `{x, y, yaw}`, agregado a `comms_agent` para esto — ver su README) y dibuja un punto sobre el mapa, convirtiendo metros del frame `map` a píxeles de la imagen usando la resolución/origen de `depot.yaml` (**hardcodeado en el HTML** — si cambia el mapa, hay que actualizar `MAP_RESOLUTION`/`MAP_ORIGIN_X`/`MAP_ORIGIN_Y`/`MAP_IMG_W`/`MAP_IMG_H` a mano).
-- **Estado**: se suscribe a `patrol/default/andino/state`, lo muestra con un color distinto por estado.
-- **Indicador de conexión, en tres niveles distintos** (no es lo mismo "llegué al cartero" que "hay alguien contestando" — ver "Comportamientos no obvios"): (1) conectando a Mosquitto, (2) conectado a Mosquitto pero sin señal del robot (`comms_agent`/`patrol_node` no están corriendo, o no llegó nada todavía), (3) señal del robot recibida hace poco = "activo"; si pasan más de 15s sin ningún `state`/`heartbeat` nuevo, vuelve a avisar.
-- **Botones**: Iniciar / Pausar / Reanudar / Retornar a base / Limpiar falla — publican a `patrol/default/andino/cmd`. **Arrancan deshabilitados** y solo se habilitan (el subconjunto que corresponda) cuando llega un `state` real del robot — así no se puede mandar un comando "al aire" sin saber si hay alguien escuchando del otro lado. Siguen la misma tabla de transiciones documentada en `patrol_fsm/README.md`.
+- **Login**: `/login` muestra un formulario, valida contra `users.json` (contraseñas con PBKDF2-SHA256 + salt, 310.000 iteraciones — mismo nivel de esfuerzo que usa Django por default). Si es correcto, `server.py` crea una sesión en memoria y pone una cookie `panel_session` (`HttpOnly`, no accesible desde JavaScript). La sesión dura 12 horas (un turno de guardia) o hasta que se reinicie `server.py` (las sesiones no se guardan a disco — ver "Qué falta").
+- **Todo lo demás pide sesión**: `/` (el panel), `/depot.png` y `/ws` redirigen a `/login` (o rechazan la conexión, en el caso del WebSocket) si no hay una cookie de sesión válida.
+- **Mapa y posición en vivo**: igual que antes — `depot.png` de fondo, posición dibujada convirtiendo metros del frame `map` a píxeles con la resolución/origen de `depot.yaml` (hardcodeado en `index.html`).
+- **Estado y botones**: igual que antes — Iniciar / Pausar / Reanudar / Retornar a base / Limpiar falla, habilitados solo según el estado real recibido (misma tabla que `patrol_fsm/README.md`). Deliberadamente sin `manual_start`/`manual_stop` (ver motivo más abajo).
+- **Indicador de conexión en tres niveles**: conectando al backend / conectado pero sin señal del robot / robot activo — misma lógica que antes, solo que ahora habla de "el backend" en vez de "Mosquitto", porque el navegador ya ni sabe que Mosquitto existe.
+- **Cerrar sesión**: link "Cerrar sesión" en el panel, borra la cookie del lado del servidor y del navegador.
 
 **Deliberadamente sin `manual_start`/`manual_stop`**: activar modo manual desde el panel sin una forma real de manejar (eso es WebRTC, todavía no existe) dejaría al robot sin nadie manejándolo — un botón roto. Se suman cuando exista la teleoperación real.
 
 ## Cómo correrlo
 
-Requiere: `comms_agent` corriendo (ver su README), y Mosquitto con un listener de WebSocket habilitado (ver más abajo, no viene así por default).
+Requiere: `python3-aiohttp` instalado (`sudo apt install python3-aiohttp`), Mosquitto corriendo con su usuario/contraseña configurados (ver `comms_agent/README.md`), y al menos un usuario humano dado de alta.
 
-**Local, en esta misma máquina:**
-```bash
-xdg-open /home/tomashut/humble_robochi/panel/index.html
-```
-O abrir `file:///home/tomashut/humble_robochi/panel/index.html` directo desde el navegador.
-
-**Desde otro dispositivo en la misma red (celular, otra PC):** hace falta servir la carpeta por HTTP, no alcanza con `file://`. Con el servidor que trae Python de fábrica, sin instalar nada:
+**1. Dar de alta un usuario (una sola vez, o cuando haga falta agregar/cambiar uno):**
 ```bash
 cd /home/tomashut/humble_robochi/panel
-python3 -m http.server 8080 --bind 0.0.0.0
+python3 manage_users.py tomas
 ```
-Y desde el otro dispositivo, abrir `http://<IP-de-esta-maquina-en-la-red>:8080` (buscar la IP con `ip -4 addr show`, la de la interfaz de WiFi/cable real — no la de interfaces virtuales tipo `lxcbr0`/`docker0` si las hay). `MQTT_HOST` en el JS se calcula solo a partir de `window.location.hostname`, así que no hace falta editar nada a mano según desde dónde se abra. Esto **no es un servicio persistente** — es un comando que corre en primer plano mientras lo necesites, no arranca solo al reiniciar la máquina.
+Pide la contraseña por teclado (no queda en el historial de la terminal) y la guarda hasheada en `users.json` (no se commitea — ver `.gitignore`).
 
-### Habilitar el listener de WebSocket + autenticación en Mosquitto (una sola vez)
-
-Por default Mosquitto solo habla MQTT "crudo" (TCP), que un navegador no puede usar — hay que agregar un listener aparte. Y apenas se define un listener a mano, Mosquitto deja de aceptar conexiones anónimas (sale de su "modo local automático"), así que conviene resolver los dos juntos:
-
+**2. Levantar el backend:**
 ```bash
-sudo mosquitto_passwd -c -b /etc/mosquitto/passwd andino patrol_2026
-sudo nano /etc/mosquitto/conf.d/websockets.conf
+cd /home/tomashut/humble_robochi/panel
+python3 server.py --mqtt-username andino --mqtt-password patrol_2026
 ```
-Contenido:
-```
-password_file /etc/mosquitto/passwd
+Por default escucha en `0.0.0.0:8080` (accesible desde cualquier dispositivo de la LAN, igual que antes) y se conecta a Mosquitto en `localhost:1883`. Ver `python3 server.py --help` para los demás parámetros (`--http-port`, `--mqtt-host`, `--mqtt-port`).
 
-listener 1883 127.0.0.1
-protocol mqtt
+**3. Abrir el panel:** `http://localhost:8080` (esta PC) o `http://<IP-de-esta-máquina-en-la-red>:8080` (otro dispositivo de la LAN — ver `comms_agent/README.md`/sesiones anteriores sobre cómo encontrar esa IP). Va a pedir login antes de mostrar nada.
 
-listener 9001 127.0.0.1
-protocol websockets
-```
-```bash
-sudo systemctl restart mosquitto
-```
-
-`andino`/`patrol_2026` tienen que coincidir con `MQTT_USERNAME`/`MQTT_PASSWORD` en `index.html` y con los parámetros que se le pasen a `comms_agent` — ver "Comportamientos no obvios" sobre qué tan real es esta autenticación.
+Como antes, **no es un servicio persistente** — es un comando en primer plano. Sigue pendiente convertirlo en un servicio `systemd` para que sobreviva reinicios sin intervención manual (ver "Qué falta").
 
 ## Comportamientos no obvios / bugs conocidos
 
-- **"Conectado a Mosquitto" no significa "el robot está prendido"** — Mosquitto es un servicio de sistema que corre solo, sin importar si `patrol_node`/`comms_agent` están corriendo. Por eso el panel distingue "conectado al broker" de "hay señal del robot" (ver arriba) y los botones no se habilitan solo por estar conectado al broker.
-- **Tampoco "hay señal del robot" significa "la simulación/Nav2 están operativos"** — `patrol_node` puede estar vivo y contestando (`patrol_state`) sin que Gazebo esté siquiera abierto. El panel no tiene forma de distinguir eso hoy; si mandás `start` en esa situación, `patrol_node` lo va a aceptar pero el goal a Nav2 va a fallar 5 veces y termina en `FALLA` (ver `patrol_fsm/README.md`).
-- **Al recargar la página, el cartel rojo ("sin señal del robot") aparece un instante antes de pasar a verde** — es esperado: `state` se publica con `retain=True`, así que Mosquitto lo entrega automáticamente al suscribirse, pero tarda una fracción de segundo. No es un bug, es el panel siendo honesto sobre lo que sabe en cada instante.
-- **La autenticación del panel es básica, no un secreto real** — usuario/contraseña quedan en texto plano dentro de `index.html`, visibles para cualquiera que abra el código fuente de la página. Sirve para filtrar conexiones anónimas casuales en la red local, no para proteger contra alguien que se tome el trabajo de mirar el HTML. Ver `comms_agent/README.md` para el detalle completo de la config de Mosquitto.
-- **Cargar el panel desde otro dispositivo no pide ningún login** — las credenciales de MQTT viajan adentro de la página y se mandan solas, sin preguntarle nada a quien la abre. O sea que cualquiera que llegue a la URL del panel (por ejemplo, otra persona en la misma red WiFi) entra igual que vos, sin que se le pida nada — confirmado probándolo desde un celular. La autenticación de Mosquitto protege contra alguien hablando MQTT crudo sin credenciales (`mosquitto_pub` a mano), no contra alguien que simplemente abre esta página.
-- `password_file` (y antes `allow_anonymous`, `bind_address`) son opciones que **Mosquitto solo permite declarar una vez, arriba de todo el archivo** — repetirlas dentro de cada bloque `listener` rompe el arranque con "Duplicate ... value in configuration". Aprendido a los golpes en varias vueltas de prueba y error.
-- **Bug sin resolver, documentado en `comms_agent/README.md`**: el listener 9001 (WebSocket) no respeta `bind_address`/`listener <puerto> 127.0.0.1` — queda escuchando en todas las interfaces de red, no solo `localhost`, a diferencia del 1883. Parece limitación de Mosquitto 2.0.11. Riesgo acotado a la red local, no a internet — aceptado por ahora en esta etapa de prototipo.
-- **`ros2 topic echo`/`comms_agent` pueden no ver una posición hasta que el robot se mueve**: AMCL no republica `/amcl_pose` a un ritmo fijo si el robot está quieto, solo en updates — si `comms_agent` arrancó después de setear la pose inicial en RViz, se puede perder esa primera publicación. Se resuelve solo apenas el robot arranca a moverse (`start`).
+- **El login protege el acceso al panel, no solo la conexión a Mosquitto.** Esto es la diferencia real con la versión anterior: antes, cualquiera que llegara a la URL entraba sin que se le pidiera nada. Ahora hace falta usuario/contraseña de persona antes de ver cualquier cosa.
+- **La sesión vive en memoria del proceso `server.py`, no en disco.** Si el backend se reinicia (se cae, se actualiza el código, se reinicia la PC), todas las sesiones activas se pierden y hay que volver a loguearse — no hay "recordarme" persistente todavía. Aceptable para este estado del proyecto, pero hay que saberlo.
+- **Sigue sin haber TLS/HTTPS.** El login manda la contraseña por HTTP plano dentro de la red local — cualquiera en esa misma red con acceso al tráfico (Wireshark, un switch mal configurado) podría verla. Es el mismo nivel de exposición que ya tenía Mosquitto (documentado en `comms_agent/README.md`) — la solución de fondo es la VPN (WireGuard) que ya está anotada como trabajo futuro, no algo para resolver en el panel en sí.
+- **"Conectado al backend" no significa "el robot está prendido"** — mismo comportamiento que antes, solo que ahora el navegador no sabe que existe Mosquitto: distingue "conectado a `server.py`" de "hay señal del robot" (state/heartbeat reales).
+- **`mqtt.js` ya no está** — si algo en el navegador tira un error tipo "mqtt is not defined", es señal de estar mirando una versión vieja cacheada del HTML; recargar forzando (Ctrl+Shift+R).
+- Los gotchas de Mosquitto en sí (per-listener vs. global, el bug del puerto 9001, AMCL sin publicar hasta que el robot se mueve) siguen aplicando igual — ver `comms_agent/README.md`. El listener 9001 (WebSocket) de Mosquitto ya no lo usa nadie desde el navegador (ahora solo lo usa `server.py`, que igual podría hablarle por el 1883 normal — queda pendiente simplificar y sacar el listener 9001 si ya no hace falta).
 
 ## Qué falta (conocido, no implementado todavía)
 
-- **Todo hardcodeado a un solo robot/instalación/mapa** (`default`/`andino`/`depot`) — no hay selector ni configuración, coherente con el alcance "v0".
-- **Sin servidor persistente** — servirlo en la red es un comando manual (`http.server`), no un servicio que arranca solo.
-- **Sin login humano real** — ver el punto de arriba sobre cargar el panel sin que pida nada.
-- **Sin teleoperación real** (WebRTC) — los botones de modo manual no están, a propósito (ver arriba).
-- **Sin manejo de reconexión visible más allá del indicador de conexión** — si se cae Mosquitto o `comms_agent`, el panel avisa pero no reintenta activamente ni reconstruye el estado más allá de lo que ofrece `mqtt.js` por default.
+- **Servidor sin persistencia real**: hay que convertirlo en servicio `systemd` para producción (mismo pendiente que ya existía, ahora aplica al backend nuevo en vez de al `http.server` viejo).
+- **Sesiones no persistidas a disco** — se pierden al reiniciar `server.py`.
+- **Un solo nivel de usuario** — cualquiera que se loguee tiene el mismo acceso (todos los botones habilitados según el estado). No hay roles (por ejemplo, "solo ver" vs. "puede comandar").
+- **Sin TLS/HTTPS** — ver arriba.
+- **Todo hardcodeado a un solo robot/instalación/mapa** (`default`/`andino`/`depot`) — no hay selector, coherente con el alcance "v0".
+- **Sin teleoperación real** (WebRTC) — los botones de modo manual no están, a propósito.

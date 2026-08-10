@@ -12,3 +12,7 @@ __pycache__/
 
 # Claude Code local config (agentes, etc.) -- se queda solo en esta PC
 .claude/
+
+# Usuarios del login del panel (contrasenas hasheadas, igual que
+# /etc/mosquitto/passwd -- son credenciales, no se commitean)
+panel/users.json

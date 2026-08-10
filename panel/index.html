@@ -3,7 +3,6 @@
 <head>
 <meta charset="utf-8">
 <title>Panel patrol_fsm (v0)</title>
-<script src="mqtt.min.js"></script>
 <style>
   body { font-family: sans-serif; background: #1e1e1e; color: #eee; margin: 0; padding: 20px; }
   h1 { font-size: 1.2rem; font-weight: normal; color: #999; }
@@ -25,6 +24,7 @@
   #conexion { font-size: 0.85rem; color: #888; margin-top: 16px; }
   #conexion .ok { color: #4caf50; }
   #conexion .mal { color: #f44336; }
+  #logout { font-size: 0.8rem; color: #888; margin-top: 16px; display: block; }
 </style>
 </head>
 <body>
@@ -38,26 +38,12 @@
       <button id="btn-resume" disabled>Reanudar</button>
       <button id="btn-return" disabled>Retornar a base</button>
       <button id="btn-clear" disabled>Limpiar falla</button>
-      <div id="conexion">conectando a MQTT...</div>
+      <div id="conexion">conectando...</div>
+      <a id="logout" href="/logout">Cerrar sesión</a>
     </div>
   </div>
 
 <script>
-// -- config especifica de esta instalacion/robot/mapa (hardcodeado para v0) --
-const INSTALLATION_ID = 'default';
-const ROBOT_ID = 'andino';
-// window.location.hostname es el host que el navegador uso para abrir esta
-// pagina -- si la abriste como file:// es vacio (cae a 'localhost'); si la
-// abriste desde otra PC como http://<ip-de-esta-maquina>:8080, es esa IP.
-// Asi el panel apunta solo al Mosquitto correcto, sin tocar codigo.
-const MQTT_HOST = window.location.hostname || 'localhost';
-const MQTT_URL = `ws://${MQTT_HOST}:9001`;
-// ojo: esto viaja en el HTML/JS que le llega al navegador, cualquiera que vea el
-// codigo fuente de la pagina lo ve. Es autenticacion basica (evita conexiones
-// anonimas casuales), no un secreto real -- ver panel/README.md.
-const MQTT_USERNAME = 'andino';
-const MQTT_PASSWORD = 'patrol_2026';
-
 // depot.yaml: resolution 0.05 m/px, origin [-7.99, -6.67, 0], imagen 605x309 px
 const MAP_RESOLUTION = 0.05;
 const MAP_ORIGIN_X = -7.99;
@@ -65,8 +51,6 @@ const MAP_ORIGIN_Y = -6.67;
 const MAP_IMG_W = 605;
 const MAP_IMG_H = 309;
 const SCALE = 2; // el canvas se dibuja al doble para que se vea mejor
-
-const base = `patrol/${INSTALLATION_ID}/${ROBOT_ID}`;
 
 // -- mapa + posicion --
 const canvas = document.getElementById('mapa');
@@ -136,28 +120,30 @@ function setEstado(estado) {
   }
 }
 
-// -- MQTT --
-// OJO: "conectado a Mosquitto" NO significa "el robot esta prendido" -- Mosquitto
-// es un servicio aparte que corre solo, sin importar si patrol_node/comms_agent
-// estan corriendo. Por eso se trackea por separado si alguna vez llego una senal
-// real del robot (state o heartbeat), y los botones quedan deshabilitados hasta
+// -- WebSocket propio contra el backend (server.py) --
+// OJO: esto ya NO es una conexion MQTT directa. El navegador le habla a
+// nuestro propio backend por WebSocket; el backend es el unico que tiene
+// la contrasena real de Mosquitto y la usa de su lado, nunca la manda
+// para aca. Ver panel/README.md.
+//
+// "conectado al backend" tampoco significa "el robot esta prendido" --
+// por eso se trackea por separado si alguna vez llego una senal real del
+// robot (state o heartbeat), y los botones quedan deshabilitados hasta
 // que eso pase.
 const conexionDiv = document.getElementById('conexion');
-const client = mqtt.connect(MQTT_URL, {
-  username: MQTT_USERNAME,
-  password: MQTT_PASSWORD,
-});
+const wsUrl = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host + '/ws';
+let ws = new WebSocket(wsUrl);
 
-let brokerConectado = false;
+let backendConectado = false;
 let ultimaSenalRobot = 0; // timestamp del ultimo state O heartbeat recibido (lo que sea)
 
 function actualizarIndicadorConexion() {
-  if (!brokerConectado) {
-    conexionDiv.innerHTML = '<span class="mal">conectando a Mosquitto...</span>';
+  if (!backendConectado) {
+    conexionDiv.innerHTML = '<span class="mal">conectando al panel...</span>';
     return;
   }
   if (ultimaSenalRobot === 0) {
-    conexionDiv.innerHTML = '<span class="mal">conectado a Mosquitto, pero sin señal del robot ' +
+    conexionDiv.innerHTML = '<span class="mal">conectado, pero sin señal del robot ' +
       '— ¿patrol_node/comms_agent están corriendo?</span>';
     return;
   }
@@ -169,44 +155,46 @@ function actualizarIndicadorConexion() {
   }
 }
 
-client.on('connect', () => {
-  brokerConectado = true;
+ws.onopen = () => {
+  backendConectado = true;
   actualizarIndicadorConexion();
-  client.subscribe(`${base}/state`);
-  client.subscribe(`${base}/position`);
-  client.subscribe(`${base}/heartbeat`);
-});
+};
 
-client.on('error', (err) => {
-  conexionDiv.innerHTML = `<span class="mal">error MQTT: ${err.message}</span>`;
-});
+ws.onerror = () => {
+  conexionDiv.innerHTML = '<span class="mal">error de conexión con el panel</span>';
+};
 
-client.on('close', () => {
-  brokerConectado = false;
-  conexionDiv.innerHTML = '<span class="mal">desconectado de Mosquitto</span>';
-});
+ws.onclose = () => {
+  backendConectado = false;
+  conexionDiv.innerHTML = '<span class="mal">desconectado del panel — recargá la página</span>';
+};
 
-client.on('message', (topic, payload) => {
-  const msg = payload.toString();
-  if (topic === `${base}/state`) {
+ws.onmessage = (event) => {
+  let msg;
+  try {
+    msg = JSON.parse(event.data);
+  } catch (e) {
+    return;
+  }
+  if (msg.type === 'state') {
     ultimaSenalRobot = Date.now();
-    setEstado(msg);
-  } else if (topic === `${base}/position`) {
-    try {
-      lastPos = JSON.parse(msg);
-      draw();
-    } catch (e) {
-      console.warn('posicion invalida:', msg);
-    }
-  } else if (topic === `${base}/heartbeat`) {
+    setEstado(msg.data);
+  } else if (msg.type === 'position') {
+    lastPos = msg.data;
+    draw();
+  } else if (msg.type === 'heartbeat') {
     ultimaSenalRobot = Date.now();
   }
-});
+};
 
 setInterval(actualizarIndicadorConexion, 3000);
 
 for (const [cmd, btn] of Object.entries(buttons)) {
-  btn.addEventListener('click', () => client.publish(`${base}/cmd`, cmd));
+  btn.addEventListener('click', () => {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: 'cmd', data: cmd }));
+    }
+  });
 }
 </script>
 </body>
