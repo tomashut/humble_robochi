@@ -24,8 +24,8 @@ COMMAND_TO_SERVICE = {
 
 class CommsAgentNode(Node):
 
-    def __init__(self):
-        super().__init__('comms_agent_node')
+    def __init__(self, **kwargs):
+        super().__init__('comms_agent_node', **kwargs)
 
         self.declare_parameter('mqtt_host', 'localhost')
         self.declare_parameter('mqtt_port', 1883)
@@ -54,6 +54,12 @@ class CommsAgentNode(Node):
             command: self.create_client(Trigger, service_name)
             for command, service_name in COMMAND_TO_SERVICE.items()
         }
+
+        # ultimo estado/posicion conocidos, para volver a publicarlos si se
+        # reconecta a Mosquitto -- ROS sigue avisando cambios aunque el
+        # enlace a Mosquitto este caido, asi que esto queda siempre al dia.
+        self._last_state = None
+        self._last_position = None
 
         state_qos = QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
         self.create_subscription(String, 'patrol_state', self._on_patrol_state, state_qos)
@@ -85,6 +91,14 @@ class CommsAgentNode(Node):
         client.subscribe(self.cmd_topic, qos=1)
         self.get_logger().info(f'Conectado a Mosquitto, suscripto a "{self.cmd_topic}".')
 
+        # si esto es una reconexion, ROS ya nos pudo haber avisado cambios
+        # mientras estabamos desconectados de Mosquitto -- los reenviamos
+        # ahora para que nadie se quede con un valor viejo.
+        if self._last_state is not None:
+            client.publish(self.state_topic, self._last_state, qos=1, retain=True)
+        if self._last_position is not None:
+            client.publish(self.position_topic, self._last_position, qos=1, retain=True)
+
     def _on_mqtt_message(self, client, userdata, msg):
         command = msg.payload.decode('utf-8').strip()
         service_client = self._service_clients.get(command)
@@ -108,18 +122,20 @@ class CommsAgentNode(Node):
     # -- ROS -> MQTT --------------------------------------------------------
 
     def _on_patrol_state(self, msg):
-        self._mqtt.publish(self.state_topic, msg.data, qos=0, retain=True)
+        self._last_state = msg.data
+        self._mqtt.publish(self.state_topic, msg.data, qos=1, retain=True)
 
     def _on_amcl_pose(self, msg):
         position = msg.pose.pose.position
         orientation = msg.pose.pose.orientation
         yaw = 2 * math.atan2(orientation.z, orientation.w)
         payload = json.dumps({'x': position.x, 'y': position.y, 'yaw': yaw})
-        self._mqtt.publish(self.position_topic, payload, qos=0, retain=True)
+        self._last_position = payload
+        self._mqtt.publish(self.position_topic, payload, qos=1, retain=True)
 
     def _publish_heartbeat(self):
         now = self.get_clock().now().to_msg()
-        self._mqtt.publish(self.heartbeat_topic, f'{now.sec}.{now.nanosec}', qos=0)
+        self._mqtt.publish(self.heartbeat_topic, f'{now.sec}.{now.nanosec}', qos=1)
 
 
 def main(args=None):

@@ -17,8 +17,11 @@ Tópicos MQTT, con el patrón `patrol/<installation_id>/<robot_id>/...` (paráme
 - **`.../cmd`** (se suscribe, QoS 1) — comandos como texto plano. Payload = una de estas palabras, tal cual estan definidas en `COMMAND_TO_SERVICE` en `comms_agent_node.py`:
   `start` · `pause` · `resume` · `manual_start` · `manual_stop` · `return_to_base` · `clear_failure`
   Cada una llama al servicio ROS correspondiente de `patrol_node` (mismos servicios que ya usa `patrol_client.py`). Son idempotentes de por sí: los servicios de `patrol_node` devuelven `success=False` sin romper nada si se llaman desde un estado que no corresponde.
-- **`.../state`** (publica, retenido) — repropaga el tópico ROS `patrol_state` tal cual, cada vez que cambia.
-- **`.../heartbeat`** (publica cada `heartbeat_interval_sec`, default 5s) — timestamp, para que algo del otro lado pueda detectar un robot caído aunque no haya cambios de estado.
+- **`.../state`** (publica, retenido, QoS 1) — repropaga el tópico ROS `patrol_state` tal cual, cada vez que cambia. QoS 1 (no 0) desde 2026-08-11 — un `FALLA` publicado en el peor momento (justo un cortecito de red) ya no se pierde sin reintento.
+- **`.../heartbeat`** (publica cada `heartbeat_interval_sec`, default 5s, QoS 1) — timestamp, para que algo del otro lado pueda detectar un robot caído aunque no haya cambios de estado.
+- **`.../position`** (publica, retenido, QoS 1) — posición de AMCL (`{x, y, yaw}`).
+
+**Resincroniza al reconectarse a Mosquitto (2026-08-11):** el nodo se acuerda en memoria del último `state`/`position` que le llegó de ROS (`_last_state`/`_last_position`, se actualizan en cada mensaje). Si el enlace a Mosquitto se corta y se reconecta, `_on_mqtt_connect` los vuelve a publicar de una — antes, tras reconectar, solo se resuscribía al tópico de comandos y no avisaba nada del estado, así que un cambio ocurrido durante el corte (por ejemplo, entrar en `FALLA`) se perdía para quien estuviera del otro lado hasta el próximo cambio real. La conexión a ROS es independiente de la de Mosquitto — sigue funcionando durante el corte, así que esos valores en memoria quedan al día en todo momento, no se congelan desde antes del corte.
 
 MQTT en sí no valida nada — no tiene el concepto de "comando válido". Toda la validación de qué es un comando conocido vive en este nodo (`comms_agent`), no en Mosquitto ni en herramientas como `mosquitto_pub`.
 
