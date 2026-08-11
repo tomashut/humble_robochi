@@ -14,6 +14,7 @@ import pytest
 
 import rclpy
 from rclpy.parameter import Parameter
+from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from std_srvs.srv import Trigger
 
@@ -71,6 +72,23 @@ def amcl_pose_con_covarianza(var_x, var_y, var_yaw):
     msg.pose.covariance[7] = var_y
     msg.pose.covariance[35] = var_yaw
     return msg
+
+
+class FakeGoalHandle:
+    """Reemplaza a un goal handle real solo para poder cancelarlo sin Nav2."""
+
+    def cancel_goal_async(self):
+        pass
+
+
+class FakeResultFuture:
+    """Simula el future que get_result_callback recibe de una accion real."""
+
+    def __init__(self, status):
+        self.status = status
+
+    def result(self):
+        return self
 
 
 # -- arranque limpio (sin state.json previo) ---------------------------------
@@ -392,5 +410,161 @@ def test_pause_patrol_desde_en_ronda_marca_actividad_previa(tmp_path, rclpy_cont
 
         saved = json.loads((tmp_path / 'state.json').read_text())
         assert saved['state'] == 'PAUSADO'
+    finally:
+        node.destroy_node()
+
+
+# -- pausar/tomar manual durante RETORNO ------------------------------------
+
+def test_pause_patrol_desde_retorno_marca_actividad_previa(tmp_path, rclpy_context):
+    node = make_node(tmp_path, rclpy_context)
+    try:
+        node.handle_start_patrol(Trigger.Request(), Trigger.Response())
+        node.handle_return_to_base(Trigger.Request(), Trigger.Response())
+
+        response = node.handle_pause_patrol(Trigger.Request(), Trigger.Response())
+
+        assert response.success is True
+        assert node.state == PatrolState.PAUSADO
+        assert node.actividad_previa == 'RETORNO'
+    finally:
+        node.destroy_node()
+
+
+def test_resume_tras_pausar_retorno_vuelve_a_retorno(tmp_path, rclpy_context):
+    node = make_node(tmp_path, rclpy_context)
+    try:
+        node.handle_start_patrol(Trigger.Request(), Trigger.Response())
+        node.handle_return_to_base(Trigger.Request(), Trigger.Response())
+        node.handle_pause_patrol(Trigger.Request(), Trigger.Response())
+
+        node.handle_resume_patrol(Trigger.Request(), Trigger.Response())
+
+        assert node.state == PatrolState.RETORNO
+    finally:
+        node.destroy_node()
+
+
+def test_manual_start_desde_retorno_marca_actividad_previa(tmp_path, rclpy_context):
+    node = make_node(tmp_path, rclpy_context)
+    try:
+        node.handle_start_patrol(Trigger.Request(), Trigger.Response())
+        node.handle_return_to_base(Trigger.Request(), Trigger.Response())
+
+        response = node.handle_manual_start(Trigger.Request(), Trigger.Response())
+
+        assert response.success is True
+        assert node.state == PatrolState.MANUAL
+        assert node.actividad_previa == 'RETORNO'
+    finally:
+        node.destroy_node()
+
+
+def test_manual_stop_y_resume_desde_retorno_vuelve_a_retorno(tmp_path, rclpy_context):
+    """El escenario original del bug, pero con RETORNO en vez de EN_RONDA."""
+    node = make_node(tmp_path, rclpy_context)
+    try:
+        node.handle_start_patrol(Trigger.Request(), Trigger.Response())
+        node.handle_return_to_base(Trigger.Request(), Trigger.Response())
+        node.handle_manual_start(Trigger.Request(), Trigger.Response())
+        node.handle_manual_stop(Trigger.Request(), Trigger.Response())
+
+        node.handle_resume_patrol(Trigger.Request(), Trigger.Response())
+
+        assert node.state == PatrolState.RETORNO
+    finally:
+        node.destroy_node()
+
+
+def test_manual_start_desde_en_ronda_sobreescribe_actividad_previa_vieja(tmp_path, rclpy_context):
+    """
+    El bug original: una nota vieja no debe sobrevivir a un ciclo nuevo.
+
+    Si actividad_previa quedo con un valor de un incidente anterior,
+    tomar control manual desde EN_RONDA lo tiene que pisar con el valor
+    correcto, no dejarlo como estaba -- si no, el resume posterior manda
+    el robot a la base en vez de seguir la ronda.
+    """
+    node = make_node(tmp_path, rclpy_context)
+    try:
+        node.handle_start_patrol(Trigger.Request(), Trigger.Response())
+        node.actividad_previa = 'RETORNO'  # simula una nota vieja pegada
+
+        node.handle_manual_start(Trigger.Request(), Trigger.Response())
+        node.handle_manual_stop(Trigger.Request(), Trigger.Response())
+        node.handle_resume_patrol(Trigger.Request(), Trigger.Response())
+
+        assert node.state == PatrolState.EN_RONDA
+    finally:
+        node.destroy_node()
+
+
+def test_pausar_retorno_no_registra_fallo_espurio(tmp_path, rclpy_context):
+    """
+    Pausar un RETORNO en curso cancela el goal, no cuenta como un fallo.
+
+    El mismo mecanismo (_expected_cancel) que ya evita esto en EN_RONDA
+    tiene que cubrir tambien RETORNO.
+    """
+    node = make_node(tmp_path, rclpy_context)
+    try:
+        node.handle_start_patrol(Trigger.Request(), Trigger.Response())
+        node.handle_return_to_base(Trigger.Request(), Trigger.Response())
+        node._current_goal_handle = FakeGoalHandle()
+
+        node.handle_pause_patrol(Trigger.Request(), Trigger.Response())
+        assert node._expected_cancel is True
+
+        node.get_result_callback(FakeResultFuture(GoalStatus.STATUS_CANCELED))
+
+        assert node.fail_count == 0
+        assert node._expected_cancel is False
+    finally:
+        node.destroy_node()
+
+
+# -- limpieza de actividad_previa cuando ya no hay nada pendiente -----------
+
+def test_actividad_previa_se_limpia_al_llegar_a_base(tmp_path, rclpy_context):
+    """
+    Completar el retorno a base borra actividad_previa.
+
+    Si no se limpia, un dato viejo puede sobrevivir a una ronda entera y
+    reaparecer en un resume mucho despues -- el bug original. El campo
+    solo queda seteado si hubo una pausa/manual de por medio (ida directa
+    a RETORNO sin pausar no lo toca), asi que ese es el camino que hace
+    falta probar.
+    """
+    node = make_node(tmp_path, rclpy_context)
+    try:
+        node.handle_start_patrol(Trigger.Request(), Trigger.Response())
+        node.handle_return_to_base(Trigger.Request(), Trigger.Response())
+        node.handle_pause_patrol(Trigger.Request(), Trigger.Response())
+        node.handle_resume_patrol(Trigger.Request(), Trigger.Response())
+        assert node.actividad_previa == 'RETORNO'
+
+        node.get_result_callback(FakeResultFuture(GoalStatus.STATUS_SUCCEEDED))
+
+        assert node.state == PatrolState.EN_BASE
+        assert node.actividad_previa is None
+    finally:
+        node.destroy_node()
+
+
+def test_actividad_previa_se_limpia_al_iniciar_ronda_nueva(tmp_path, rclpy_context):
+    """
+    /start_patrol limpia actividad_previa aunque haya quedado sucia.
+
+    Defensivo: cubre cualquier camino a EN_BASE que no la haya limpiado
+    (por ejemplo, /clear_failure tras una FALLA).
+    """
+    write_estado(tmp_path, 'EN_BASE', actividad_previa='RETORNO')
+    node = make_node(tmp_path, rclpy_context)
+    try:
+        assert node.actividad_previa == 'RETORNO'  # arranca con el dato viejo
+
+        node.handle_start_patrol(Trigger.Request(), Trigger.Response())
+
+        assert node.actividad_previa is None
     finally:
         node.destroy_node()

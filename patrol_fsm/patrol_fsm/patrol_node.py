@@ -441,6 +441,9 @@ class PatrolNode(Node):
             self.fail_count = 0
             if self.state == PatrolState.RETORNO:
                 self.get_logger().info('Base alcanzada.')
+                # lo que estaba pendiente (si algo lo estaba) ya se resolvio
+                # solo -- no dejar una nota vieja para una pausa futura.
+                self.actividad_previa = None
                 self._end_round('retorno_a_base')
                 self._enter_state(PatrolState.EN_BASE)
             elif self.state == PatrolState.EN_RONDA:
@@ -495,6 +498,9 @@ class PatrolNode(Node):
             response.message = f'No se puede iniciar la ronda desde {self.state.value}.'
             return response
 
+        # defensivo: cubre cualquier camino a EN_BASE que no la haya limpiado
+        # ya (por ejemplo, /clear_failure tras una FALLA).
+        self.actividad_previa = None
         self._enter_state(PatrolState.EN_RONDA)
         self._start_round()
         self.send_next_goal()
@@ -503,13 +509,14 @@ class PatrolNode(Node):
         return response
 
     def handle_pause_patrol(self, request, response):
-        if self.state not in (PatrolState.EN_RONDA, PatrolState.INTERRUMPIDO):
+        if self.state not in (
+                PatrolState.EN_RONDA, PatrolState.RETORNO, PatrolState.INTERRUMPIDO):
             response.success = False
             response.message = f'No se puede pausar desde {self.state.value}.'
             return response
 
-        if self.state == PatrolState.EN_RONDA:
-            self.actividad_previa = PatrolState.EN_RONDA.value
+        if self.state in (PatrolState.EN_RONDA, PatrolState.RETORNO):
+            self.actividad_previa = self.state.value
         # si viene de INTERRUMPIDO, actividad_previa ya esta seteada de antes
         # -- un humano decidio pausarlo en vez de dejar que siga intentando
         # reanudarse solo. A partir de aca es una pausa deliberada como
@@ -537,10 +544,17 @@ class PatrolNode(Node):
         return response
 
     def handle_manual_start(self, request, response):
-        if self.state not in (PatrolState.EN_RONDA, PatrolState.PAUSADO, PatrolState.INTERRUMPIDO):
+        if self.state not in (
+                PatrolState.EN_RONDA, PatrolState.PAUSADO,
+                PatrolState.RETORNO, PatrolState.INTERRUMPIDO):
             response.success = False
             response.message = f'No se puede tomar control manual desde {self.state.value}.'
             return response
+
+        if self.state in (PatrolState.EN_RONDA, PatrolState.RETORNO):
+            self.actividad_previa = self.state.value
+        # si viene de PAUSADO o INTERRUMPIDO, actividad_previa ya esta seteada
+        # de antes.
 
         self._cancel_auto_resume()
         self._cancel_convergence_spin()

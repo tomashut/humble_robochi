@@ -21,12 +21,16 @@ Expuesta como servicios ROS 2 (`std_srvs/Trigger`), cada uno valida el estado ac
 | Servicio | Desde | Hace |
 |---|---|---|
 | `/start_patrol` | `EN_BASE` | Arranca la ronda, manda el goal pendiente. |
-| `/pause_patrol` | `EN_RONDA` o `INTERRUMPIDO` | Cancela el goal activo (si hay), mata cualquier auto-reanudación pendiente, pasa a `PAUSADO`. |
+| `/pause_patrol` | `EN_RONDA`, `RETORNO` o `INTERRUMPIDO` | Cancela el goal activo (si hay), mata cualquier auto-reanudación pendiente, pasa a `PAUSADO`. |
 | `/resume_patrol` | `PAUSADO` o `INTERRUMPIDO` | Reenvía el goal pendiente (Nav2 replanifica desde la posición actual) — decisión humana, no pasa por el chequeo de localización. |
-| `/manual_start` | `EN_RONDA`, `PAUSADO` o `INTERRUMPIDO` | Cancela el goal activo, pasa a `MANUAL`. |
+| `/manual_start` | `EN_RONDA`, `PAUSADO`, `RETORNO` o `INTERRUMPIDO` | Cancela el goal activo, pasa a `MANUAL`. |
 | `/manual_stop` | `MANUAL` | Pasa a `PAUSADO` (no reanuda solo). |
 | `/return_to_base` | `EN_RONDA`, `PAUSADO` o `INTERRUMPIDO` | Navega al waypoint 0. |
 | `/clear_failure` | `FALLA` | Resetea el contador de fallos y pasa a `EN_BASE` (no mueve al robot). |
+
+**`actividad_previa` — a qué actividad reanudar:** `EN_RONDA` y `RETORNO` son las dos "actividades" (el robot navegando hacia algo); `PAUSADO`, `MANUAL` e `INTERRUMPIDO` son "suspensiones" (el robot detenido, esperando). Cada vez que se sale de una actividad hacia una suspensión (`/pause_patrol` o `/manual_start` desde `EN_RONDA`/`RETORNO`, o el aterrizaje en `INTERRUMPIDO` tras un reinicio) se anota cuál era en `actividad_previa`; `/resume_patrol` la lee para saber a cuál de las dos volver. Las transiciones entre suspensiones (`INTERRUMPIDO`→`PAUSADO`, `PAUSADO`↔`MANUAL`) no la tocan — lo que está pendiente no cambia solo porque el robot cambió de forma de esperar. Se limpia (`None`) al llegar a `EN_BASE` y al arrancar una ronda nueva con `/start_patrol`, para que un dato viejo no le gane a un ciclo completo.
+
+**Decisión de producto, a propósito:** ahora que se puede pausar/tomar manual durante `RETORNO`, `/resume_patrol` en ese caso **siempre** termina de volver a la base — no hay forma de decirle "en realidad seguí la ronda, no vayas a la base". Si eso hace falta, hay que esperar a que llegue a `EN_BASE` y mandar `/start_patrol` de nuevo. No hay comando de "cancelar el retorno" — deliberadamente fuera de alcance por ahora, no un olvido.
 
 Reintentos: hasta 5 fallos consecutivos de Nav2 (goal rechazado, abortado, o cancelado sin que lo haya pedido el propio nodo) antes de pasar a `FALLA`.
 
