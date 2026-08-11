@@ -1,4 +1,5 @@
 import json
+import math
 from datetime import date, datetime
 from enum import Enum
 from pathlib import Path
@@ -12,8 +13,8 @@ from rclpy.qos import QoSProfile, QoSDurabilityPolicy
 
 from action_msgs.msg import GoalStatus
 from ament_index_python.packages import get_package_share_directory
-from geometry_msgs.msg import PoseStamped
-from nav2_msgs.action import NavigateToPose
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
+from nav2_msgs.action import NavigateToPose, Spin
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 from tf_transformations import quaternion_from_euler
@@ -34,8 +35,8 @@ class PatrolNode(Node):
     RETRY_DELAY_SEC = 1.0
     NEXT_WAYPOINT_DELAY_SEC = 1.0
 
-    def __init__(self):
-        super().__init__('patrol_node')
+    def __init__(self, wait_for_nav2=True, **kwargs):
+        super().__init__('patrol_node', **kwargs)
 
         default_waypoints_file = str(
             Path(get_package_share_directory('patrol_fsm')) / 'config' / 'waypoints.yaml')
@@ -60,6 +61,21 @@ class PatrolNode(Node):
             self.get_parameter('auto_resume_timeout_sec').get_parameter_value().integer_value)
         self._auto_resume_timer = None
 
+        # umbrales de confianza de AMCL antes de reanudar solo tras un reinicio --
+        # medidos en vivo en la simulacion (mapa depot) el 2026-08-11: AMCL
+        # opera normalmente entre 0.15-0.3 en posicion, hasta ~0.12 en
+        # orientacion durante giros; estos umbrales dejan margen por encima
+        # de eso. Si el mapa o el sensor cambian, hay que volver a medir.
+        self.declare_parameter('amcl_position_covariance_threshold', 0.5)
+        self.amcl_position_covariance_threshold = (
+            self.get_parameter('amcl_position_covariance_threshold')
+            .get_parameter_value().double_value)
+        self.declare_parameter('amcl_orientation_covariance_threshold', 0.3)
+        self.amcl_orientation_covariance_threshold = (
+            self.get_parameter('amcl_orientation_covariance_threshold')
+            .get_parameter_value().double_value)
+        self._latest_amcl_covariance = None  # (var_x, var_y, var_yaw) o None si nunca llego
+
         saved_state = self._load_saved_state()
         if saved_state is None:
             self.current_goal = 0
@@ -80,7 +96,13 @@ class PatrolNode(Node):
         state_qos = QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
         self._state_pub = self.create_publisher(String, 'patrol_state', state_qos)
 
+        self.create_subscription(
+            PoseWithCovarianceStamped, 'amcl_pose', self._on_amcl_pose, 10)
+
         self._action_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
+        self._spin_action_client = ActionClient(self, Spin, 'spin')
+        self._spin_goal_handle = None
+        self._spin_in_progress = False
 
         self.create_service(Trigger, '/start_patrol', self.handle_start_patrol)
         self.create_service(Trigger, '/pause_patrol', self.handle_pause_patrol)
@@ -90,9 +112,10 @@ class PatrolNode(Node):
         self.create_service(Trigger, '/return_to_base', self.handle_return_to_base)
         self.create_service(Trigger, '/clear_failure', self.handle_clear_failure)
 
-        self.get_logger().info('Esperando al servidor de acción NavigateToPose...')
-        self._action_client.wait_for_server()
-        self.get_logger().info('Servidor listo.')
+        if wait_for_nav2:
+            self.get_logger().info('Esperando al servidor de acción NavigateToPose...')
+            self._action_client.wait_for_server()
+            self.get_logger().info('Servidor listo.')
 
         if previous_state is None or previous_state in (PatrolState.EN_BASE, PatrolState.FALLA):
             self._enter_state(previous_state or PatrolState.EN_BASE)
@@ -168,14 +191,96 @@ class PatrolNode(Node):
             self._auto_resume_timer.cancel()
             self._auto_resume_timer = None
 
+    def _on_amcl_pose(self, msg):
+        cov = msg.pose.covariance
+        self._latest_amcl_covariance = (cov[0], cov[7], cov[35])  # var_x, var_y, var_yaw
+
+        # el chequeo de antes de arrancar (gate + giro) no alcanza si la
+        # localizacion se pierde DESPUES, ya caminando -- eso solo se nota
+        # con evidencia real de movimiento, y para entonces el robot ya
+        # esta en marcha. Por eso se vuelve a mirar en cada mensaje nuevo
+        # mientras esta navegando de verdad (EN_RONDA/RETORNO), no solo
+        # antes de reanudar.
+        if self.state in (PatrolState.EN_RONDA, PatrolState.RETORNO):
+            if not self._localizacion_confiable():
+                self._localizacion_perdida_durante_navegacion()
+
+    def _localizacion_confiable(self):
+        if self._latest_amcl_covariance is None:
+            return False
+        var_x, var_y, var_yaw = self._latest_amcl_covariance
+        return (var_x < self.amcl_position_covariance_threshold
+                and var_y < self.amcl_position_covariance_threshold
+                and var_yaw < self.amcl_orientation_covariance_threshold)
+
+    def _localizacion_perdida_durante_navegacion(self):
+        self.get_logger().error(
+            'Se perdio la confianza en la localizacion (AMCL) mientras navegaba '
+            f'(estado {self.state.value}); deteniendo el robot.')
+        self._log_event('localizacion_perdida', estado=self.state.value)
+        self._end_round('localizacion_perdida')
+        self._enter_state(PatrolState.FALLA)
+        self._cancel_active_goal()
+
     def _fire_auto_resume(self):
-        self._cancel_auto_resume()
         if self.state != PatrolState.PAUSADO:
+            self._cancel_auto_resume()
             return
+
+        if self._spin_in_progress:
+            return  # ya hay un giro de convergencia en curso, no arrancar otro
+
+        # Antes de confiar en la covarianza hay que forzar una actualizacion real
+        # de AMCL -- quieto, AMCL no revisa nada (no supera update_min_d/a), asi
+        # que el numero puede seguir "congelado" en lo que haya quedado de un
+        # pose estimate viejo o de fabrica, sin reflejar la realidad. Un giro en
+        # el lugar (sin trasladarse, mas seguro que arrancar a caminar a ciegas)
+        # alcanza para que AMCL vuelva a mirar de verdad.
+        self._spin_in_progress = True
         self.get_logger().warn(
             f'Nadie reanudo en {self.auto_resume_timeout_sec}s tras el reinicio; '
-            'reanudando la ronda sola.')
+            'girando en el lugar para que AMCL confirme la localizacion antes de decidir.')
+        self._log_event('auto_resume_girando_para_converger')
+
+        goal_msg = Spin.Goal()
+        goal_msg.target_yaw = 2 * math.pi
+        send_goal_future = self._spin_action_client.send_goal_async(goal_msg)
+        send_goal_future.add_done_callback(self._on_spin_goal_response)
+
+    def _on_spin_goal_response(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self._spin_in_progress = False
+            self.get_logger().error(
+                'El giro de convergencia fue rechazado; reintento en el proximo ciclo.')
+            return
+        self._spin_goal_handle = goal_handle
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self._on_spin_result)
+
+    def _on_spin_result(self, future):
+        self._spin_goal_handle = None
+        self._spin_in_progress = False
+
+        if self.state != PatrolState.PAUSADO:
+            return  # alguien tomo control mientras giraba
+
+        if not self._localizacion_confiable():
+            self.get_logger().warn(
+                'Localizacion (AMCL) sigue sin ser confiable despues de girar; no reanudo '
+                f'solo. Reintento en {self.auto_resume_timeout_sec}s.')
+            self._log_event('auto_resume_esperando_localizacion')
+            return  # no cancelo el timer: vuelve a sonar solo, se re-evalua entonces
+
+        self._cancel_auto_resume()
+        self.get_logger().warn('Localizacion confiable tras el giro; reanudando la ronda sola.')
         self._resume(reason='auto_tras_reinicio')
+
+    def _cancel_convergence_spin(self):
+        if self._spin_goal_handle is not None:
+            self._spin_goal_handle.cancel_goal_async()
+            self._spin_goal_handle = None
+        self._spin_in_progress = False
 
     # -- persistencia de estado (sobrevive reinicios) --------------------------
 
@@ -355,6 +460,7 @@ class PatrolNode(Node):
             return response
 
         self._cancel_auto_resume()
+        self._cancel_convergence_spin()
         self._resume()
         response.success = True
         response.message = 'Ronda reanudada.'
@@ -367,6 +473,7 @@ class PatrolNode(Node):
             return response
 
         self._cancel_auto_resume()
+        self._cancel_convergence_spin()
         self._enter_state(PatrolState.MANUAL)
         self._cancel_active_goal()
         self._log_event('interrupted', reason='manual')
@@ -392,6 +499,7 @@ class PatrolNode(Node):
             return response
 
         self._cancel_auto_resume()
+        self._cancel_convergence_spin()
         self._enter_state(PatrolState.RETORNO)
         self._cancel_active_goal()
         self._log_event('interrupted', reason='retorno_a_base')
