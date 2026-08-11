@@ -1,7 +1,9 @@
-"""Tests de comms_agent_node, contra el Mosquitto real que corre como
-servicio de sistema en esta maquina (no se simula ni se mockea el broker).
-Usa un installation_id/robot_id de prueba para no pisar los topicos del
-robot real mientras corre.
+"""
+Tests de comms_agent_node, contra el Mosquitto real de esta maquina.
+
+No se simula ni se mockea el broker -- se usa el servicio de sistema tal
+cual. Usa un installation_id/robot_id de prueba para no pisar los topicos
+del robot real mientras corre.
 """
 
 import rclpy
@@ -30,9 +32,12 @@ def make_node(rclpy_context):
 
 
 class FakeMqttClient:
-    """Reemplaza al cliente real solo para poder inspeccionar que se
-    llamo a publish() con lo esperado, sin depender del timing real
-    de una reconexion de red."""
+    """
+    Reemplaza al cliente real para poder inspeccionar las llamadas.
+
+    Sirve para chequear que se llamo a publish() con lo esperado, sin
+    depender del timing real de una reconexion de red.
+    """
 
     def __init__(self):
         self.published = []
@@ -62,8 +67,11 @@ def test_reenvia_ultimo_estado_y_posicion_al_reconectar(rclpy_context):
 
 
 def test_no_publica_nada_si_nunca_hubo_estado(rclpy_context):
-    """Primera conexion real: todavia no llego nada de ROS, no hay que
-    inventar un estado."""
+    """
+    Primera conexion real: todavia no llego nada de ROS.
+
+    No hay que inventar un estado.
+    """
     node = make_node(rclpy_context)
     try:
         fake_client = FakeMqttClient()

@@ -6,25 +6,26 @@ Este README describe el estado actual del paquete y se va a ir actualizando a me
 
 ## Qué hace hoy
 
-Máquina de estados formal con seis estados:
+Máquina de estados formal con siete estados:
 
 - `EN_BASE` — inactivo, listo para iniciar una ronda.
 - `EN_RONDA` — navegando la secuencia de waypoints.
-- `PAUSADO` — ronda interrumpida, esperando reanudación.
+- `PAUSADO` — pausa **deliberada**: solo se llega por decisión de un humano (`/pause_patrol` o `/manual_stop`). Nunca se auto-reanuda, bajo ninguna circunstancia, ni siquiera después de un reinicio — siempre hace falta un comando.
 - `MANUAL` — goal de Nav2 cancelado, robot bajo teleoperación.
 - `RETORNO` — volviendo al waypoint base.
-- `FALLA` — se superaron los reintentos permitidos ante fallas de Nav2; el robot queda detenido y reportando, sin moverse a ciegas.
+- `FALLA` — se superaron los reintentos permitidos ante fallas de Nav2 (o se perdió la confianza en la localización navegando, ver más abajo); el robot queda detenido y reportando, sin moverse a ciegas.
+- `INTERRUMPIDO` — aterrizaje de un reinicio no planeado a mitad de `EN_RONDA` o `RETORNO`. A diferencia de `PAUSADO`, acá sí se intenta reanudar solo (con chequeos de por medio) — ver la sección de auto-reanudación. Nunca se llega acá por una decisión humana, solo desde el arranque del nodo.
 
 Expuesta como servicios ROS 2 (`std_srvs/Trigger`), cada uno valida el estado actual antes de transicionar:
 
 | Servicio | Desde | Hace |
 |---|---|---|
 | `/start_patrol` | `EN_BASE` | Arranca la ronda, manda el goal pendiente. |
-| `/pause_patrol` | `EN_RONDA` | Cancela el goal activo, pasa a `PAUSADO`. |
-| `/resume_patrol` | `PAUSADO` | Reenvía el goal pendiente (Nav2 replanifica desde la posición actual). |
-| `/manual_start` | `EN_RONDA` o `PAUSADO` | Cancela el goal activo, pasa a `MANUAL`. |
+| `/pause_patrol` | `EN_RONDA` o `INTERRUMPIDO` | Cancela el goal activo (si hay), mata cualquier auto-reanudación pendiente, pasa a `PAUSADO`. |
+| `/resume_patrol` | `PAUSADO` o `INTERRUMPIDO` | Reenvía el goal pendiente (Nav2 replanifica desde la posición actual) — decisión humana, no pasa por el chequeo de localización. |
+| `/manual_start` | `EN_RONDA`, `PAUSADO` o `INTERRUMPIDO` | Cancela el goal activo, pasa a `MANUAL`. |
 | `/manual_stop` | `MANUAL` | Pasa a `PAUSADO` (no reanuda solo). |
-| `/return_to_base` | `EN_RONDA` o `PAUSADO` | Navega al waypoint 0. |
+| `/return_to_base` | `EN_RONDA`, `PAUSADO` o `INTERRUMPIDO` | Navega al waypoint 0. |
 | `/clear_failure` | `FALLA` | Resetea el contador de fallos y pasa a `EN_BASE` (no mueve al robot). |
 
 Reintentos: hasta 5 fallos consecutivos de Nav2 (goal rechazado, abortado, o cancelado sin que lo haya pedido el propio nodo) antes de pasar a `FALLA`.
@@ -54,10 +55,14 @@ El nodo escribe un JSON Lines por día (`rounds_log_dir`, default `~/.local/shar
 | `round_started` | Se abre una ronda (`start_patrol` desde `EN_BASE`, o automáticamente al cerrar el círculo del recorrido). | — |
 | `waypoint_reached` | El robot llega a un waypoint navegando en `EN_RONDA`. | `waypoint_name` |
 | `interrupted` | `pause_patrol`, `manual_start` o `return_to_base`. | `reason` (`pausado`/`manual`/`retorno_a_base`) |
-| `resumed` | `resume_patrol`. | — |
+| `resumed` | `resume_patrol`, o auto-reanudación exitosa desde `INTERRUMPIDO`. | `actividad` (`EN_RONDA`/`RETORNO`), `reason` (ausente si fue un humano; `auto_tras_reinicio` si fue sola) |
 | `goal_failed` | Cada intento fallido de Nav2 (rechazado, abortado, cancelado sin pedirlo). | `reason`, `fail_count` |
-| `round_ended` | Se cierra la ronda. | `result`: `completada` (dio la vuelta completa al circuito y arranca otra al toque), `retorno_a_base` (se cortó por un `return_to_base` exitoso), o `falla` (llegó a `FALLA`). |
+| `round_ended` | Se cierra la ronda. | `result`: `completada` (dio la vuelta completa al circuito y arranca otra al toque), `retorno_a_base` (se cortó por un `return_to_base` exitoso), `falla` (llegó a `FALLA` por reintentos de Nav2), o `localizacion_perdida` (llegó a `FALLA` por perder la confianza en AMCL navegando). |
 | `falla_reconocida` | `clear_failure`. | — |
+| `reiniciado` | El nodo arranca y encuentra un estado persistido que no era `EN_BASE`/`FALLA` (aterriza en `INTERRUMPIDO` o `PAUSADO` según el caso, ver más abajo). | `estado_anterior` |
+| `auto_resume_girando_para_converger` | Desde `INTERRUMPIDO`, se cumplió el timeout y arranca el giro de convergencia antes de decidir. | — |
+| `auto_resume_esperando_localizacion` | El giro terminó pero la localización sigue sin ser confiable — no reanuda, reintenta en el próximo ciclo. | — |
+| `localizacion_perdida` | La vigilancia continua detectó que se perdió la confianza en AMCL mientras navegaba (`EN_RONDA`/`RETORNO`) — pasa a `FALLA`. | `estado` (desde cuál de los dos) |
 
 **Qué define una "ronda":** una vuelta completa al circuito de waypoints (del primero al último y de nuevo al principio), no un día completo de patrullaje (eso es la "sesión" = el archivo diario, que puede contener muchas rondas). Pausas y modo manual son interrupciones dentro de la misma ronda; un `return_to_base` exitoso, en cambio, la cierra — porque puede quedarse ahí un tiempo indefinido (cargando) y no queremos una ronda "abierta" cruzando archivos de varios días.
 
@@ -68,30 +73,43 @@ jq 'select(.round_id == "20260807-143210123")' rondas/2026-08-07.jsonl
 
 ## Persistencia de estado (sobrevive reinicios)
 
-**Esto ya está implementado — no es un pendiente.** El nodo guarda su estado (`state`, `current_goal`, `fail_count`, `round_id`) en un JSON (`state_file`, default `~/.local/share/patrol_fsm/state.json`) cada vez que algo de eso cambia, con escritura atómica (archivo temporal + rename) para no corromperlo si se corta la luz justo en el medio.
+El nodo guarda su estado (`state`, `current_goal`, `fail_count`, `round_id`, `actividad_previa`) en un JSON (`state_file`, default `~/.local/share/patrol_fsm/state.json`) cada vez que algo de eso cambia, con escritura atómica (archivo temporal + rename) para no corromperlo si se corta la luz justo en el medio.
 
-Al arrancar, si encuentra un estado guardado:
-- Si era `EN_BASE` o `FALLA`, lo respeta tal cual (`FALLA` sigue exigiendo `/clear_failure` — un reinicio no debe borrar una falla real).
-- Si era cualquier otro estado activo (`EN_RONDA`, `PAUSADO`, `MANUAL`, `RETORNO`) — es decir, se cortó a media ronda — **nunca reanuda navegación solo**. Aterriza en `PAUSADO`, conservando `current_goal` y `round_id` intactos, y agrega un evento `reiniciado` al registro de ejecuciones (con `estado_anterior`) para que quede documentado por qué esa ronda se demoró. Hace falta `/resume_patrol` (continúa el mismo punto pendiente) o `/return_to_base` para que vuelva a moverse — nunca se mueve a ciegas después de un apagado no planeado.
-- Si el archivo de estado no existe, está corrupto, o tiene un `current_goal` fuera de rango, se ignora con un warning y arranca fresco desde `EN_BASE` (a diferencia del YAML de waypoints, que sí falla duro si está mal — acá preferimos degradar a un estado seguro antes que impedir que el nodo arranque).
+Al arrancar, según el estado guardado:
 
-### Auto-reanudación tras un reinicio, si nadie contesta
+| Estado persistido | Aterriza en | ¿Auto-reanuda? |
+|---|---|---|
+| `EN_BASE` o `FALLA` | Igual, tal cual | — (`FALLA` sigue exigiendo `/clear_failure`) |
+| `EN_RONDA` o `RETORNO` | `INTERRUMPIDO` (`actividad_previa` guarda cuál de las dos era) | Sí, con el gate de localización de la sección de abajo |
+| `INTERRUMPIDO` (reinicio encima de otro reinicio sin resolver) | `INTERRUMPIDO`, conservando la `actividad_previa` que ya tenía | Sí, igual que arriba |
+| `MANUAL` | `PAUSADO` directo | **No, nunca** — no hay ningún objetivo de navegación que retomar solo, alguien estaba manejando |
+| `PAUSADO` | Igual, `PAUSADO` | **No, nunca** — es una pausa deliberada, un humano ya decidió frenarlo |
 
-**También implementado, así funciona hoy por default — es personalizable.** Quedarse en `PAUSADO` para siempre tras un reinicio suena seguro, pero si es de noche y no hay nadie mirando el panel, el robot deja de patrullar indefinidamente por un simple corte de luz de 2 segundos — contradice el propósito de un robot de seguridad desatendido.
+Cada uno de estos aterrizajes agrega un evento `reiniciado` al registro de ejecuciones (con `estado_anterior`), para que quede documentado por qué esa ronda se demoró.
 
-Por eso, **solo en el caso de aterrizar en `PAUSADO` por un reinicio no planeado** (no aplica a un `/pause_patrol` manual y deliberado — ese respeta la decisión del operador y no se auto-reanuda), el nodo arranca un temporizador de `auto_resume_timeout_sec` segundos (parámetro/argumento de launch, **default 300 = 5 minutos**). Si nadie mandó `/resume_patrol`, `/manual_start` ni `/return_to_base` antes de que se cumpla ese plazo, el nodo intenta reanudar solo — pero, a diferencia de la primera versión de esto, ya no confía ciegamente en que pasó tiempo: ahora verifica la localización primero (ver abajo).
+Si el archivo de estado no existe, está corrupto, o tiene un `current_goal` fuera de rango, se ignora con un warning y arranca fresco desde `EN_BASE` (a diferencia del YAML de waypoints, que sí falla duro si está mal — acá preferimos degradar a un estado seguro antes que impedir que el nodo arranque).
 
-Si Nav2 vuelve a fallar tras la auto-reanudación, cae en el mismo camino de reintentos/`FALLA` de siempre — no hace falta lógica especial, la máquina de estados ya contiene ese caso.
+**Por qué `PAUSADO` e `INTERRUMPIDO` son estados distintos, y no uno solo con una bandera:** la primera versión de esto (2026-08-11) usaba un único estado `PAUSADO` más un campo extra (`pause_reason`) para distinguir "pausa deliberada de un operador" de "aterrizaje de un reinicio sin resolver". Funcionaba, pero es el antipatrón clásico de máquinas de estados: dos situaciones con comportamiento distinto (¿se auto-reanuda? ¿quién la puede sacar? ¿a dónde reanuda?) metidas en el mismo estado, distinguidas por contexto oculto en vez de por la propia máquina. Separarlos en dos estados hace explícito lo que antes había que inferir, y el panel/MQTT/log distinguen los dos casos gratis (es el mismo estado que ya se publica, sin escribir nada extra).
+
+### Auto-reanudación desde `INTERRUMPIDO`, si nadie contesta
+
+Quedarse esperando para siempre tras un reinicio suena seguro, pero si es de noche y no hay nadie mirando el panel, el robot deja de patrullar indefinidamente por un simple corte de luz de 2 segundos — contradice el propósito de un robot de seguridad desatendido. Por eso `INTERRUMPIDO` (a diferencia de `PAUSADO`) sí intenta resolverse solo: arranca un temporizador de `auto_resume_timeout_sec` segundos (parámetro/argumento de launch, **default 300 = 5 minutos**). Si nadie mandó `/resume_patrol`, `/pause_patrol`, `/manual_start` ni `/return_to_base` antes de que se cumpla ese plazo, intenta reanudar solo — con los chequeos de la sección siguiente de por medio, nunca a ciegas.
+
+Si el chequeo no pasa, no se da por vencido: se vuelve a intentar en el próximo ciclo, indefinidamente, hasta que alguien intervenga o la localización se confirme buena. Si Nav2 vuelve a fallar navegando después de una auto-reanudación exitosa, cae en el mismo camino de reintentos/`FALLA` de siempre.
+
+**Salir de `INTERRUMPIDO` por decisión humana:** las tres formas (`/resume_patrol`, `/pause_patrol`, `/return_to_base`) matan el temporizador y cualquier giro en curso. `/pause_patrol` en particular es la forma de decirle "dejá de intentar solo, yo lo veo" — pasa a `PAUSADO`, conservando la `actividad_previa` por si más adelante se pide `/resume_patrol` desde ahí.
 
 ### Verificación de localización antes de auto-reanudar (implementado 2026-08-11)
 
-La idea original de "usar AMCL para verificar que el robot sabe dónde está antes de auto-reanudar" (antes anotada acá como pendiente) ya está hecha, en tres capas — probadas en vivo en la simulación, no solo en teoría:
+Tres capas, probadas en vivo en la simulación, no solo en teoría:
 
-1. **Chequeo de covarianza**: `patrol_node` ahora se suscribe a `amcl_pose` y no auto-reanuda si la incertidumbre de posición u orientación está por encima de un umbral (`amcl_position_covariance_threshold`, default `0.5`; `amcl_orientation_covariance_threshold`, default `0.3` — medidos en vivo en el mapa `depot`, no son valores de manual genérico, que resultaron demasiado exigentes y causaban que nunca reanudara).
+1. **Chequeo de covarianza**: `patrol_node` se suscribe a `amcl_pose` y no auto-reanuda si la incertidumbre de posición u orientación está por encima de un umbral (`amcl_position_covariance_threshold`, default `0.5`; `amcl_orientation_covariance_threshold`, default `0.3` — medidos en vivo en el mapa `depot`, no son valores de manual genérico, que resultaron demasiado exigentes y causaban que nunca reanudara).
 2. **Giro de convergencia**: como AMCL no actualiza nada si el robot está quieto (no supera `update_min_d`/`update_min_a` de su config), antes de evaluar la covarianza el nodo manda un giro de 360° en el lugar (acción `Spin` de Nav2) para forzar una lectura real. **Probado en vivo que esto solo no alcanza siempre** — con una pose inicial mal dada a propósito, un segundo giro pasó el chequeo estando igual de mal ubicado (girar prueba orientación, no si la posición de fondo es correcta).
-3. **Vigilancia continua mientras navega**: mientras está en `EN_RONDA` o `RETORNO`, cada mensaje nuevo de AMCL se sigue chequeando. Si la incertidumbre se dispara *mientras camina*, cancela el objetivo activo y pasa directo a `FALLA` (evento `localizacion_perdida`, necesita `/clear_failure` de un humano). **Esta fue la única capa que en la práctica agarró todos los casos de "pose falsa" probados** — el movimiento real es la única evidencia que expone una localización mentirosa; girar repetidas veces no.
+3. **Vigilancia continua mientras navega**: mientras está en `EN_RONDA` o `RETORNO` (nunca en `INTERRUMPIDO`, que todavía no está navegando), cada mensaje nuevo de AMCL se sigue chequeando. Si la incertidumbre está mal **`localizacion_perdida_confirmaciones` veces seguidas** (default 3 — evita que un solo pico transitorio dispare una falla), cancela el objetivo activo y pasa directo a `FALLA` (evento `localizacion_perdida`, necesita `/clear_failure` de un humano). **Esta fue la única capa que en la práctica agarró todos los casos de "pose falsa" probados** — el movimiento real es la única evidencia que expone una localización mentirosa; girar repetidas veces no.
 
 **Límite conocido y aceptado, no una falla de diseño:** las tres capas juntas todavía necesitan que el robot se mueva un poco (~15-20s en las pruebas) antes de poder detectar una localización falsa — no hay forma de saberlo con el robot parado, solo moviéndose. Durante esa ventana, el evitar-obstáculos local de Nav2 (basado en el láser en tiempo real, independiente de si AMCL sabe bien la posición global) sigue protegiendo contra chocar con algo que tenga físicamente cerca — pero no contra lo que un láser 2D no puede ver (pozos, escalones). El chequeo que cerraría esto del todo sin necesitar moverse (comparar el láser contra el mapa directamente) queda pendiente para cuando esté el robot físico.
+
+**Otro límite conocido, encontrado en vivo el mismo día:** una pose que pasa el chequeo de covarianza es "lo suficientemente segura como para intentar", no "perfectamente exacta" — puede tener un error real de algunos centímetros, suficiente para que el robot crea que un hueco angosto (una puerta, una esquina justa) es pasable cuando en realidad no le entra, y termine chocando o reintentando sin éxito ahí. Ni el gate ni el evitar-obstáculos local de Nav2 cubren completamente este caso intermedio. Sin diseño todavía.
 
 ## Comportamientos no obvios (aprendidos probando en simulación)
 

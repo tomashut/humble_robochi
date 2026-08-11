@@ -134,8 +134,12 @@ class CommsAgentNode(Node):
         self._mqtt.publish(self.position_topic, payload, qos=1, retain=True)
 
     def _publish_heartbeat(self):
+        # qos=0 a proposito, distinto del resto: un heartbeat solo vale si
+        # llega ahora. Uno viejo reencolado y entregado tarde tras un corte
+        # no es informacion, es ruido -- puede hacerle creer al panel que
+        # hay senal reciente cuando en realidad es un reintento de algo viejo.
         now = self.get_clock().now().to_msg()
-        self._mqtt.publish(self.heartbeat_topic, f'{now.sec}.{now.nanosec}', qos=1)
+        self._mqtt.publish(self.heartbeat_topic, f'{now.sec}.{now.nanosec}', qos=0)
 
 
 def main(args=None):

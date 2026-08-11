@@ -16,6 +16,7 @@
   .estado-MANUAL { background: #01579b; color: #fff; }
   .estado-RETORNO { background: #4a148c; color: #fff; }
   .estado-FALLA { background: #b71c1c; color: #fff; }
+  .estado-INTERRUMPIDO { background: #e65100; color: #fff; }
   .estado-desconocido { background: #000; color: #666; border: 1px dashed #444; }
   button { display: block; width: 100%; margin-bottom: 8px; padding: 10px; font-size: 1rem;
            background: #333; color: #eee; border: 1px solid #555; border-radius: 4px; cursor: pointer; }
@@ -103,12 +104,15 @@ const buttons = {
 
 // que botones tienen sentido segun el estado actual (misma tabla que patrol_fsm/README.md)
 const ENABLED_BY_STATE = {
-  EN_BASE:  ['start'],
-  EN_RONDA: ['pause', 'return_to_base'],
-  PAUSADO:  ['resume', 'return_to_base'],
-  MANUAL:   [],
-  RETORNO:  [],
-  FALLA:    ['clear_failure'],
+  EN_BASE:      ['start'],
+  EN_RONDA:     ['pause', 'return_to_base'],
+  PAUSADO:      ['resume', 'return_to_base'],
+  MANUAL:       [],
+  RETORNO:      [],
+  FALLA:        ['clear_failure'],
+  // aterrizaje de un reinicio a media ronda/retorno, todavia intentando
+  // reanudarse solo -- un humano puede intervenir de las 3 formas
+  INTERRUMPIDO: ['resume', 'pause', 'return_to_base'],
 };
 
 function setEstado(estado) {

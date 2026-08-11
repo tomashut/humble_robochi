@@ -27,6 +27,9 @@ class PatrolState(Enum):
     MANUAL = 'MANUAL'
     RETORNO = 'RETORNO'
     FALLA = 'FALLA'
+    # aterrizaje de un reinicio a media ronda/retorno, todavia sin resolver
+    # -- ver README para el porque no es lo mismo que PAUSADO
+    INTERRUMPIDO = 'INTERRUMPIDO'
 
 
 class PatrolNode(Node):
@@ -76,16 +79,30 @@ class PatrolNode(Node):
             .get_parameter_value().double_value)
         self._latest_amcl_covariance = None  # (var_x, var_y, var_yaw) o None si nunca llego
 
+        # cuantas lecturas malas SEGUIDAS hacen falta, mientras navega, para
+        # dar por perdida la localizacion -- una sola lectura mala puede ser
+        # un pico transitorio (una zona con poca geometria, por ejemplo), no
+        # necesariamente que se perdio de verdad.
+        self.declare_parameter('localizacion_perdida_confirmaciones', 3)
+        self.localizacion_perdida_confirmaciones = (
+            self.get_parameter('localizacion_perdida_confirmaciones')
+            .get_parameter_value().integer_value)
+        self._lecturas_amcl_malas_seguidas = 0
+
         saved_state = self._load_saved_state()
         if saved_state is None:
             self.current_goal = 0
             self.fail_count = 0
             self.round_id = None
+            self.actividad_previa = None
             previous_state = None
         else:
             self.current_goal = saved_state['current_goal']
             self.fail_count = saved_state['fail_count']
             self.round_id = saved_state['round_id']
+            # .get() a proposito: archivos de estado de antes de este campo
+            # no lo tienen.
+            self.actividad_previa = saved_state.get('actividad_previa')
             previous_state = PatrolState(saved_state['state'])
 
         self._current_goal_handle = None
@@ -119,12 +136,42 @@ class PatrolNode(Node):
 
         if previous_state is None or previous_state in (PatrolState.EN_BASE, PatrolState.FALLA):
             self._enter_state(previous_state or PatrolState.EN_BASE)
-        else:
+        elif previous_state == PatrolState.MANUAL:
+            # estaba bajo control manual cuando se corto -- no hay ningun
+            # objetivo de navegacion que retomar solo, y reanudar autonomia
+            # sin que un humano lo pida explicitamente es mas riesgoso que
+            # en los demas casos. Aterriza directo en PAUSADO, nunca se
+            # auto-reanuda -- siempre hace falta un humano.
             self.get_logger().warn(
-                f'Estado persistido era {previous_state.value}; por seguridad arranca en PAUSADO '
-                'en vez de reanudar navegación solo. Pedí /resume_patrol o /return_to_base.')
+                'Estado persistido era MANUAL; por seguridad arranca en PAUSADO -- nadie '
+                'retoma el control manual solo. Pedí /resume_patrol, /manual_start o '
+                '/return_to_base.')
             self._log_event('reiniciado', estado_anterior=previous_state.value)
             self._enter_state(PatrolState.PAUSADO)
+        elif previous_state == PatrolState.PAUSADO:
+            # ya estaba pausado -- por un humano, la unica forma de llegar
+            # a PAUSADO -- cuando se corto. Se mantiene igual, sin timer.
+            self.get_logger().warn(
+                'Estado persistido era PAUSADO; se mantiene igual. Nadie retoma una '
+                'pausa deliberada solo.')
+            self._log_event('reiniciado', estado_anterior=previous_state.value)
+            self._enter_state(PatrolState.PAUSADO)
+        else:
+            # EN_RONDA, RETORNO, o INTERRUMPIDO (reinicio encima de un
+            # reinicio anterior sin resolver) -- se corto a media actividad
+            # real. Aterriza (o se queda) en INTERRUMPIDO, que si intenta
+            # retomarla sola, con el giro + chequeo de localizacion de por
+            # medio.
+            self.get_logger().warn(
+                f'Estado persistido era {previous_state.value}; por seguridad arranca en '
+                'INTERRUMPIDO en vez de reanudar navegación solo. Pedí /resume_patrol, '
+                '/pause_patrol o /return_to_base.')
+            self._log_event('reiniciado', estado_anterior=previous_state.value)
+            if previous_state != PatrolState.INTERRUMPIDO:
+                self.actividad_previa = previous_state.value
+            # si previous_state YA era INTERRUMPIDO, se conserva la
+            # actividad_previa cargada arriba (doble reinicio sin resolver)
+            self._enter_state(PatrolState.INTERRUMPIDO)
             self._schedule_auto_resume()
 
     # -- utilidades de pose -------------------------------------------------
@@ -161,6 +208,11 @@ class PatrolNode(Node):
     # -- máquina de estados ---------------------------------------------------
 
     def _enter_state(self, new_state):
+        if new_state in (PatrolState.EN_RONDA, PatrolState.RETORNO):
+            # arranca a navegar de nuevo -- que no arrastre un conteo de
+            # lecturas malas de un tramo anterior (por ejemplo, de antes de
+            # una pausa).
+            self._lecturas_amcl_malas_seguidas = 0
         self.state = new_state
         self.get_logger().info(f'Estado -> {new_state.value}')
         msg = String()
@@ -176,8 +228,11 @@ class PatrolNode(Node):
         fn()
 
     def _resume(self, reason=None):
-        self._enter_state(PatrolState.EN_RONDA)
-        self._log_event('resumed', **({'reason': reason} if reason else {}))
+        activity = (PatrolState.RETORNO if self.actividad_previa == PatrolState.RETORNO.value
+                    else PatrolState.EN_RONDA)
+        self._enter_state(activity)
+        extra = {'reason': reason} if reason else {}
+        self._log_event('resumed', actividad=activity.value, **extra)
         self.send_next_goal()
 
     def _schedule_auto_resume(self):
@@ -202,8 +257,12 @@ class PatrolNode(Node):
         # mientras esta navegando de verdad (EN_RONDA/RETORNO), no solo
         # antes de reanudar.
         if self.state in (PatrolState.EN_RONDA, PatrolState.RETORNO):
-            if not self._localizacion_confiable():
-                self._localizacion_perdida_durante_navegacion()
+            if self._localizacion_confiable():
+                self._lecturas_amcl_malas_seguidas = 0
+            else:
+                self._lecturas_amcl_malas_seguidas += 1
+                if self._lecturas_amcl_malas_seguidas >= self.localizacion_perdida_confirmaciones:
+                    self._localizacion_perdida_durante_navegacion()
 
     def _localizacion_confiable(self):
         if self._latest_amcl_covariance is None:
@@ -223,7 +282,7 @@ class PatrolNode(Node):
         self._cancel_active_goal()
 
     def _fire_auto_resume(self):
-        if self.state != PatrolState.PAUSADO:
+        if self.state != PatrolState.INTERRUMPIDO:
             self._cancel_auto_resume()
             return
 
@@ -262,7 +321,7 @@ class PatrolNode(Node):
         self._spin_goal_handle = None
         self._spin_in_progress = False
 
-        if self.state != PatrolState.PAUSADO:
+        if self.state != PatrolState.INTERRUMPIDO:
             return  # alguien tomo control mientras giraba
 
         if not self._localizacion_confiable():
@@ -307,6 +366,7 @@ class PatrolNode(Node):
             'current_goal': self.current_goal,
             'fail_count': self.fail_count,
             'round_id': self.round_id,
+            'actividad_previa': self.actividad_previa,
         }
         tmp_path = self.state_file.with_suffix('.tmp')
         with open(tmp_path, 'w') as f:
@@ -359,7 +419,8 @@ class PatrolNode(Node):
     def goal_response_callback(self, future):
         goal_handle = future.result()
         if not goal_handle.accepted:
-            self._register_failure(f'Goal #{self.current_goal + 1} rechazado por el servidor de acciones')
+            self._register_failure(
+                f'Goal #{self.current_goal + 1} rechazado por el servidor de acciones')
             return
 
         self._current_goal_handle = goal_handle
@@ -384,7 +445,8 @@ class PatrolNode(Node):
                 self._enter_state(PatrolState.EN_BASE)
             elif self.state == PatrolState.EN_RONDA:
                 self.get_logger().info(f'Waypoint #{self.current_goal + 1} alcanzado.')
-                self._log_event('waypoint_reached', waypoint_name=self.waypoint_names[self.current_goal])
+                self._log_event(
+                    'waypoint_reached', waypoint_name=self.waypoint_names[self.current_goal])
                 self.current_goal = (self.current_goal + 1) % len(self.waypoints)
                 if self.current_goal == 0:
                     self._end_round('completada')
@@ -441,11 +503,19 @@ class PatrolNode(Node):
         return response
 
     def handle_pause_patrol(self, request, response):
-        if self.state != PatrolState.EN_RONDA:
+        if self.state not in (PatrolState.EN_RONDA, PatrolState.INTERRUMPIDO):
             response.success = False
             response.message = f'No se puede pausar desde {self.state.value}.'
             return response
 
+        if self.state == PatrolState.EN_RONDA:
+            self.actividad_previa = PatrolState.EN_RONDA.value
+        # si viene de INTERRUMPIDO, actividad_previa ya esta seteada de antes
+        # -- un humano decidio pausarlo en vez de dejar que siga intentando
+        # reanudarse solo. A partir de aca es una pausa deliberada como
+        # cualquier otra: nunca se auto-reanuda.
+        self._cancel_auto_resume()
+        self._cancel_convergence_spin()
         self._enter_state(PatrolState.PAUSADO)
         self._cancel_active_goal()
         self._log_event('interrupted', reason='pausado')
@@ -454,7 +524,7 @@ class PatrolNode(Node):
         return response
 
     def handle_resume_patrol(self, request, response):
-        if self.state != PatrolState.PAUSADO:
+        if self.state not in (PatrolState.PAUSADO, PatrolState.INTERRUMPIDO):
             response.success = False
             response.message = f'No se puede reanudar desde {self.state.value}.'
             return response
@@ -467,7 +537,7 @@ class PatrolNode(Node):
         return response
 
     def handle_manual_start(self, request, response):
-        if self.state not in (PatrolState.EN_RONDA, PatrolState.PAUSADO):
+        if self.state not in (PatrolState.EN_RONDA, PatrolState.PAUSADO, PatrolState.INTERRUMPIDO):
             response.success = False
             response.message = f'No se puede tomar control manual desde {self.state.value}.'
             return response
@@ -489,11 +559,12 @@ class PatrolNode(Node):
 
         self._enter_state(PatrolState.PAUSADO)
         response.success = True
-        response.message = 'Control manual liberado. Ronda en pausa, pedí /resume_patrol para continuar.'
+        response.message = (
+            'Control manual liberado. Ronda en pausa, pedí /resume_patrol para continuar.')
         return response
 
     def handle_return_to_base(self, request, response):
-        if self.state not in (PatrolState.EN_RONDA, PatrolState.PAUSADO):
+        if self.state not in (PatrolState.EN_RONDA, PatrolState.PAUSADO, PatrolState.INTERRUMPIDO):
             response.success = False
             response.message = f'No se puede retornar a base desde {self.state.value}.'
             return response

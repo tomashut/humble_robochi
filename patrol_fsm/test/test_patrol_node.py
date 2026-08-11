@@ -1,9 +1,10 @@
-"""Tests de la logica de patrol_node, sin necesitar Gazebo/Nav2 corriendo.
+"""
+Tests de la logica de patrol_node, sin necesitar Gazebo/Nav2 corriendo.
 
-Se construye el nodo con wait_for_nav2=False (salta la espera del
-servidor de accion) y con archivos de estado/rondas/waypoints propios
-en un directorio temporal, para no tocar nunca los reales del usuario
-ni depender de una simulacion levantada.
+Se construye el nodo con wait_for_nav2=False (salta la espera del servidor
+de accion) y con archivos de estado/rondas/waypoints propios en un
+directorio temporal, para no tocar nunca los reales del usuario ni
+depender de una simulacion levantada.
 """
 
 import json
@@ -50,6 +51,28 @@ def make_node(tmp_path, rclpy_context, waypoints=None, **param_overrides):
     return PatrolNode(wait_for_nav2=False, parameter_overrides=overrides)
 
 
+def write_estado(tmp_path, state, actividad_previa=None, current_goal=1):
+    """Simula un state.json dejado por un corte, en el estado que sea."""
+    state_file = tmp_path / 'state.json'
+    payload = {
+        'state': state,
+        'current_goal': current_goal,
+        'fail_count': 0,
+        'round_id': '20260811-000000000',
+    }
+    if actividad_previa is not None:
+        payload['actividad_previa'] = actividad_previa
+    state_file.write_text(json.dumps(payload))
+
+
+def amcl_pose_con_covarianza(var_x, var_y, var_yaw):
+    msg = PoseWithCovarianceStamped()
+    msg.pose.covariance[0] = var_x
+    msg.pose.covariance[7] = var_y
+    msg.pose.covariance[35] = var_yaw
+    return msg
+
+
 # -- arranque limpio (sin state.json previo) ---------------------------------
 
 def test_arranca_en_base_sin_estado_previo(tmp_path, rclpy_context):
@@ -62,65 +85,120 @@ def test_arranca_en_base_sin_estado_previo(tmp_path, rclpy_context):
         node.destroy_node()
 
 
-# -- auto-resume solo debe reanudar con localizacion confiable ---------------
+# -- aterrizaje de reinicio: a donde cae cada estado persistido --------------
 
-def write_estado_pausado_por_reinicio(tmp_path):
-    """Simula un state.json dejado por un corte a mitad de ronda."""
-    state_file = tmp_path / 'state.json'
-    state_file.write_text(json.dumps({
-        'state': 'EN_RONDA',
-        'current_goal': 1,
-        'fail_count': 0,
-        'round_id': '20260811-000000000',
-    }))
+def test_en_ronda_persistido_aterriza_en_interrumpido_y_agenda_timer(tmp_path, rclpy_context):
+    write_estado(tmp_path, 'EN_RONDA')
+    node = make_node(tmp_path, rclpy_context, auto_resume_timeout_sec=15)
+    try:
+        assert node.state == PatrolState.INTERRUMPIDO
+        assert node.actividad_previa == 'EN_RONDA'
+        assert node._auto_resume_timer is not None
+    finally:
+        node.destroy_node()
 
 
-def amcl_pose_con_covarianza(var_x, var_y, var_yaw):
-    msg = PoseWithCovarianceStamped()
-    msg.pose.covariance[0] = var_x
-    msg.pose.covariance[7] = var_y
-    msg.pose.covariance[35] = var_yaw
-    return msg
+def test_retorno_persistido_aterriza_en_interrumpido_con_esa_actividad(tmp_path, rclpy_context):
+    write_estado(tmp_path, 'RETORNO')
+    node = make_node(tmp_path, rclpy_context, auto_resume_timeout_sec=15)
+    try:
+        assert node.state == PatrolState.INTERRUMPIDO
+        assert node.actividad_previa == 'RETORNO'
+        assert node._auto_resume_timer is not None
+    finally:
+        node.destroy_node()
 
+
+def test_manual_persistido_aterriza_en_pausado_sin_timer(tmp_path, rclpy_context):
+    """
+    El caso que marco la revision de Fable.
+
+    Nadie retoma el control manual solo -- ni siquiera pasa por INTERRUMPIDO.
+    """
+    write_estado(tmp_path, 'MANUAL')
+    node = make_node(tmp_path, rclpy_context, auto_resume_timeout_sec=15)
+    try:
+        assert node.state == PatrolState.PAUSADO
+        assert node._auto_resume_timer is None
+    finally:
+        node.destroy_node()
+
+
+def test_pausado_persistido_se_mantiene_pausado_sin_timer(tmp_path, rclpy_context):
+    """
+    PAUSADO es puro: solo se llega por decision humana.
+
+    Nunca se auto-reanuda -- ni siquiera despues de un reinicio.
+    """
+    write_estado(tmp_path, 'PAUSADO')
+    node = make_node(tmp_path, rclpy_context, auto_resume_timeout_sec=15)
+    try:
+        assert node.state == PatrolState.PAUSADO
+        assert node._auto_resume_timer is None
+    finally:
+        node.destroy_node()
+
+
+def test_doble_reinicio_en_interrumpido_conserva_la_actividad_previa(tmp_path, rclpy_context):
+    """
+    Si ya estaba en INTERRUMPIDO y se reinicia de nuevo, conserva la actividad.
+
+    No hay que perderla ni confundirla con 'INTERRUMPIDO' como si fuera la
+    actividad en si.
+    """
+    write_estado(tmp_path, 'INTERRUMPIDO', actividad_previa='RETORNO')
+    node = make_node(tmp_path, rclpy_context, auto_resume_timeout_sec=15)
+    try:
+        assert node.state == PatrolState.INTERRUMPIDO
+        assert node.actividad_previa == 'RETORNO'
+        assert node._auto_resume_timer is not None
+    finally:
+        node.destroy_node()
+
+
+# -- INTERRUMPIDO: giro de convergencia antes de decidir ----------------------
 
 def test_fire_auto_resume_arranca_un_giro_no_reanuda_directo(tmp_path, rclpy_context):
-    """_fire_auto_resume ya no decide nada por si sola -- primero gira, y
-    recien la decision real pasa por _on_spin_result (proximos tests)."""
-    write_estado_pausado_por_reinicio(tmp_path)
+    """
+    _fire_auto_resume ya no decide nada por si sola: primero gira.
+
+    La decision real pasa por _on_spin_result (ver los proximos tests).
+    """
+    write_estado(tmp_path, 'EN_RONDA')
     node = make_node(tmp_path, rclpy_context)
     try:
         node._on_amcl_pose(amcl_pose_con_covarianza(0.001, 0.001, 0.001))  # bien ubicado
         node._fire_auto_resume()
-        assert node.state == PatrolState.PAUSADO  # no reanuda antes de girar
+        assert node.state == PatrolState.INTERRUMPIDO  # no reanuda antes de girar
         assert node._spin_in_progress is True
     finally:
         node.destroy_node()
 
 
 def test_no_reanuda_tras_girar_sin_ningun_dato_de_amcl(tmp_path, rclpy_context):
-    write_estado_pausado_por_reinicio(tmp_path)
+    write_estado(tmp_path, 'EN_RONDA')
     node = make_node(tmp_path, rclpy_context)
     try:
-        assert node.state == PatrolState.PAUSADO  # aterrizo pausado, por el reinicio
+        assert node.state == PatrolState.INTERRUMPIDO  # aterrizo aca, por el reinicio
         node._on_spin_result(None)  # simula que el giro termino
-        assert node.state == PatrolState.PAUSADO  # sin dato de AMCL, no se mueve
+        assert node.state == PatrolState.INTERRUMPIDO  # sin dato de AMCL, no se mueve
     finally:
         node.destroy_node()
 
 
 def test_no_reanuda_tras_girar_con_localizacion_mala(tmp_path, rclpy_context):
-    write_estado_pausado_por_reinicio(tmp_path)
+    write_estado(tmp_path, 'EN_RONDA')
     node = make_node(tmp_path, rclpy_context)
     try:
         node._on_amcl_pose(amcl_pose_con_covarianza(1.0, 1.0, 1.0))  # bien perdido
         node._on_spin_result(None)
-        assert node.state == PatrolState.PAUSADO
+        assert node.state == PatrolState.INTERRUMPIDO
     finally:
         node.destroy_node()
 
 
-def test_reanuda_tras_girar_con_localizacion_buena(tmp_path, rclpy_context):
-    write_estado_pausado_por_reinicio(tmp_path)
+def test_reanuda_a_en_ronda_tras_girar_con_localizacion_buena(tmp_path, rclpy_context):
+    write_estado(tmp_path, 'EN_RONDA')
     node = make_node(tmp_path, rclpy_context)
     try:
         node._on_amcl_pose(amcl_pose_con_covarianza(0.001, 0.001, 0.001))  # bien ubicado
@@ -130,10 +208,30 @@ def test_reanuda_tras_girar_con_localizacion_buena(tmp_path, rclpy_context):
         node.destroy_node()
 
 
+def test_reanuda_a_retorno_si_la_actividad_previa_era_retorno(tmp_path, rclpy_context):
+    """
+    La razon de ser de actividad_previa.
+
+    No perder que estaba volviendo a base, en vez de simplemente volver a
+    patrullar.
+    """
+    write_estado(tmp_path, 'RETORNO')
+    node = make_node(tmp_path, rclpy_context)
+    try:
+        node._on_amcl_pose(amcl_pose_con_covarianza(0.001, 0.001, 0.001))
+        node._on_spin_result(None)
+        assert node.state == PatrolState.RETORNO
+    finally:
+        node.destroy_node()
+
+
 def test_manual_start_cancela_un_giro_en_curso(tmp_path, rclpy_context):
-    """Si un humano toma control mientras el robot esta girando para
-    converger, no tiene que quedar girando solo por su cuenta."""
-    write_estado_pausado_por_reinicio(tmp_path)
+    """
+    Si un humano toma control mientras gira para converger, se cancela.
+
+    No tiene que quedar girando solo por su cuenta.
+    """
+    write_estado(tmp_path, 'EN_RONDA')
     node = make_node(tmp_path, rclpy_context)
     try:
         node._fire_auto_resume()
@@ -142,7 +240,59 @@ def test_manual_start_cancela_un_giro_en_curso(tmp_path, rclpy_context):
         response = node.handle_manual_start(Trigger.Request(), Trigger.Response())
 
         assert response.success is True
+        assert node.state == PatrolState.MANUAL
         assert node._spin_in_progress is False
+    finally:
+        node.destroy_node()
+
+
+# -- salidas de INTERRUMPIDO por decision humana ------------------------------
+
+def test_pause_patrol_desde_interrumpido_pasa_a_pausado_y_mata_el_timer(tmp_path, rclpy_context):
+    write_estado(tmp_path, 'EN_RONDA')
+    node = make_node(tmp_path, rclpy_context, auto_resume_timeout_sec=15)
+    try:
+        assert node.state == PatrolState.INTERRUMPIDO
+        assert node._auto_resume_timer is not None
+
+        response = node.handle_pause_patrol(Trigger.Request(), Trigger.Response())
+
+        assert response.success is True
+        assert node.state == PatrolState.PAUSADO
+        assert node._auto_resume_timer is None
+    finally:
+        node.destroy_node()
+
+
+def test_resume_patrol_desde_interrumpido_reanuda_directo_sin_esperar_el_gate(
+        tmp_path, rclpy_context):
+    """
+    Un humano pidiendo resume es una decision informada.
+
+    No pasa por el chequeo de covarianza, igual que un resume normal desde
+    PAUSADO.
+    """
+    write_estado(tmp_path, 'EN_RONDA')
+    node = make_node(tmp_path, rclpy_context, auto_resume_timeout_sec=15)
+    try:
+        response = node.handle_resume_patrol(Trigger.Request(), Trigger.Response())
+
+        assert response.success is True
+        assert node.state == PatrolState.EN_RONDA
+        assert node._auto_resume_timer is None
+    finally:
+        node.destroy_node()
+
+
+def test_return_to_base_desde_interrumpido(tmp_path, rclpy_context):
+    write_estado(tmp_path, 'EN_RONDA')
+    node = make_node(tmp_path, rclpy_context, auto_resume_timeout_sec=15)
+    try:
+        response = node.handle_return_to_base(Trigger.Request(), Trigger.Response())
+
+        assert response.success is True
+        assert node.state == PatrolState.RETORNO
+        assert node._auto_resume_timer is None
     finally:
         node.destroy_node()
 
@@ -150,14 +300,51 @@ def test_manual_start_cancela_un_giro_en_curso(tmp_path, rclpy_context):
 # -- vigilancia continua: si se pierde la localizacion YA navegando ----------
 
 def test_se_va_a_falla_si_se_pierde_localizacion_navegando(tmp_path, rclpy_context):
+    """Con el debounce default (3), hacen falta 3 lecturas malas SEGUIDAS."""
     node = make_node(tmp_path, rclpy_context)
     try:
         node.handle_start_patrol(Trigger.Request(), Trigger.Response())
         assert node.state == PatrolState.EN_RONDA
 
-        node._on_amcl_pose(amcl_pose_con_covarianza(5.0, 5.0, 2.0))  # se perdio
+        node._on_amcl_pose(amcl_pose_con_covarianza(5.0, 5.0, 2.0))
+        node._on_amcl_pose(amcl_pose_con_covarianza(5.0, 5.0, 2.0))
+        assert node.state == PatrolState.EN_RONDA  # todavia no, faltan confirmaciones
+        node._on_amcl_pose(amcl_pose_con_covarianza(5.0, 5.0, 2.0))
 
         assert node.state == PatrolState.FALLA
+    finally:
+        node.destroy_node()
+
+
+def test_una_lectura_mala_sola_no_alcanza(tmp_path, rclpy_context):
+    """
+    Un pico transitorio no tiene que mandar a FALLA.
+
+    Es justo lo que senalo Fable como riesgo de falsos positivos.
+    """
+    node = make_node(tmp_path, rclpy_context)
+    try:
+        node.handle_start_patrol(Trigger.Request(), Trigger.Response())
+
+        node._on_amcl_pose(amcl_pose_con_covarianza(5.0, 5.0, 2.0))
+
+        assert node.state == PatrolState.EN_RONDA
+    finally:
+        node.destroy_node()
+
+
+def test_una_lectura_buena_en_el_medio_resetea_el_contador(tmp_path, rclpy_context):
+    node = make_node(tmp_path, rclpy_context)
+    try:
+        node.handle_start_patrol(Trigger.Request(), Trigger.Response())
+
+        node._on_amcl_pose(amcl_pose_con_covarianza(5.0, 5.0, 2.0))
+        node._on_amcl_pose(amcl_pose_con_covarianza(5.0, 5.0, 2.0))
+        node._on_amcl_pose(amcl_pose_con_covarianza(0.01, 0.01, 0.01))  # se recupero
+        node._on_amcl_pose(amcl_pose_con_covarianza(5.0, 5.0, 2.0))
+        node._on_amcl_pose(amcl_pose_con_covarianza(5.0, 5.0, 2.0))
+
+        assert node.state == PatrolState.EN_RONDA  # el contador arranco de nuevo
     finally:
         node.destroy_node()
 
@@ -176,8 +363,11 @@ def test_sigue_en_ronda_si_la_localizacion_sigue_bien(tmp_path, rclpy_context):
 
 
 def test_localizacion_mala_no_afecta_si_no_esta_navegando(tmp_path, rclpy_context):
-    """El chequeo continuo es solo mientras navega -- en PAUSADO, por ejemplo,
-    no tiene que disparar nada (ese caso lo cubre el giro de convergencia)."""
+    """
+    El chequeo continuo es solo mientras navega.
+
+    En PAUSADO, por ejemplo, no tiene que disparar nada.
+    """
     node = make_node(tmp_path, rclpy_context)
     try:
         assert node.state == PatrolState.EN_BASE
@@ -185,5 +375,22 @@ def test_localizacion_mala_no_afecta_si_no_esta_navegando(tmp_path, rclpy_contex
         node._on_amcl_pose(amcl_pose_con_covarianza(5.0, 5.0, 2.0))
 
         assert node.state == PatrolState.EN_BASE
+    finally:
+        node.destroy_node()
+
+
+# -- pausa deliberada: nunca se auto-reanuda, sin importar el origen --------
+
+def test_pause_patrol_desde_en_ronda_marca_actividad_previa(tmp_path, rclpy_context):
+    node = make_node(tmp_path, rclpy_context)
+    try:
+        node.handle_start_patrol(Trigger.Request(), Trigger.Response())
+        node.handle_pause_patrol(Trigger.Request(), Trigger.Response())
+
+        assert node.state == PatrolState.PAUSADO
+        assert node.actividad_previa == 'EN_RONDA'
+
+        saved = json.loads((tmp_path / 'state.json').read_text())
+        assert saved['state'] == 'PAUSADO'
     finally:
         node.destroy_node()

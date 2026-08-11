@@ -14,12 +14,16 @@ def generate_launch_description():
         description='Puerto del broker Mosquitto.')
     mqtt_username_arg = DeclareLaunchArgument(
         'mqtt_username', default_value='',
-        description='Usuario para autenticarse contra Mosquitto. Vacio = sin autenticacion '
-                     '(falla si Mosquitto tiene allow_anonymous en false).')
+        description=(
+            'Usuario para autenticarse contra Mosquitto. Vacio = sin autenticacion '
+            '(falla si Mosquitto tiene allow_anonymous en false).'
+        ))
     mqtt_password_arg = DeclareLaunchArgument(
         'mqtt_password', default_value='',
-        description='Contrasena para mqtt_username. No tiene default real a proposito, '
-                     'para no dejar una credencial hardcodeada en el repo.')
+        description=(
+            'Contrasena para mqtt_username. No tiene default real a proposito, '
+            'para no dejar una credencial hardcodeada en el repo.'
+        ))
     installation_id_arg = DeclareLaunchArgument(
         'installation_id', default_value='default',
         description='Identificador de la instalacion (para topicos MQTT multi-sitio).')
