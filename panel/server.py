@@ -31,6 +31,7 @@ BASE_TOPIC = f'patrol/{INSTALLATION_ID}/{ROBOT_ID}'
 STATE_TOPIC = f'{BASE_TOPIC}/state'
 POSITION_TOPIC = f'{BASE_TOPIC}/position'
 HEARTBEAT_TOPIC = f'{BASE_TOPIC}/heartbeat'
+EVENTS_TOPIC = f'{BASE_TOPIC}/events'
 CMD_TOPIC = f'{BASE_TOPIC}/cmd'
 
 # mismo subconjunto de comandos que ya ofrecia el panel -- sin
@@ -175,6 +176,7 @@ def make_mqtt_client(app, loop, host, port, username, password):
         c.subscribe(STATE_TOPIC, qos=1)
         c.subscribe(POSITION_TOPIC, qos=1)
         c.subscribe(HEARTBEAT_TOPIC, qos=1)
+        c.subscribe(EVENTS_TOPIC, qos=1)
         print('[server] conectado a Mosquitto')
 
     def on_message(c, userdata, msg):
@@ -187,10 +189,18 @@ def make_mqtt_client(app, loop, host, port, username, password):
         elif msg.topic == HEARTBEAT_TOPIC:
             key = 'heartbeat'
             out = {'type': 'heartbeat', 'data': None}
+        elif msg.topic == EVENTS_TOPIC:
+            # a diferencia de state/position/heartbeat, un evento no se
+            # cachea en last_known -- es un hecho puntual, no algo que un
+            # navegador que se conecta despues deba recibir como si
+            # acabara de pasar.
+            key = None
+            out = {'type': 'event', 'data': json.loads(msg.payload.decode('utf-8'))}
         else:
             return
         text = json.dumps(out)
-        app['last_known'][key] = text
+        if key is not None:
+            app['last_known'][key] = text
         for ws in list(app['websockets']):
             asyncio.run_coroutine_threadsafe(_safe_send(ws, text), loop)
 

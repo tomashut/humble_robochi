@@ -112,6 +112,10 @@ class PatrolNode(Node):
 
         state_qos = QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
         self._state_pub = self.create_publisher(String, 'patrol_state', state_qos)
+        # volatil a proposito (sin TRANSIENT_LOCAL): un evento es un hecho
+        # puntual, no un estado -- un suscriptor nuevo no debe recibir el
+        # ultimo evento como si acabara de pasar.
+        self._events_pub = self.create_publisher(String, 'patrol_events', 10)
 
         self.create_subscription(
             PoseWithCovarianceStamped, 'amcl_pose', self._on_amcl_pose, 10)
@@ -386,6 +390,12 @@ class PatrolNode(Node):
         log_path = self.rounds_log_dir / f'{date.today().isoformat()}.jsonl'
         with open(log_path, 'a') as f:
             f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+
+        # mismo payload que la linea del log -- garantia de coherencia entre
+        # lo que queda escrito y lo que sale por el topico.
+        msg = String()
+        msg.data = json.dumps(entry, ensure_ascii=False)
+        self._events_pub.publish(msg)
 
     def _start_round(self):
         self.round_id = datetime.now().strftime('%Y%m%d-%H%M%S%f')[:-3]

@@ -66,6 +66,26 @@ def test_reenvia_ultimo_estado_y_posicion_al_reconectar(rclpy_context):
         node.destroy_node()
 
 
+def test_forward_evento_a_events_topic_sin_retain(rclpy_context):
+    node = make_node(rclpy_context)
+    try:
+        fake_client = FakeMqttClient()
+        node._mqtt = fake_client
+
+        msg = String()
+        msg.data = '{"event": "goal_failed", "round_id": "x", "fail_count": 5}'
+        node._on_patrol_event(msg)
+
+        event_publishes = [p for p in fake_client.published if p[0] == node.events_topic]
+        assert len(event_publishes) == 1
+        topic, payload, qos, retain = event_publishes[0]
+        assert payload == msg.data
+        assert qos == 1
+        assert retain is False
+    finally:
+        node.destroy_node()
+
+
 def test_no_publica_nada_si_nunca_hubo_estado(rclpy_context):
     """
     Primera conexion real: todavia no llego nada de ROS.

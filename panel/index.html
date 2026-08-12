@@ -26,6 +26,17 @@
   #conexion .ok { color: #4caf50; }
   #conexion .mal { color: #f44336; }
   #logout { font-size: 0.8rem; color: #888; margin-top: 16px; display: block; }
+  #eventos { min-width: 320px; max-width: 420px; }
+  #eventos h2 { font-size: 1rem; font-weight: normal; color: #999; margin: 0 0 8px; }
+  #lista-eventos { list-style: none; margin: 0; padding: 0; max-height: 560px; overflow-y: auto; }
+  #lista-eventos li { padding: 6px 8px; margin-bottom: 4px; border-radius: 4px; font-size: 0.85rem;
+                       border-left: 3px solid #555; background: #2a2a2a; }
+  #lista-eventos .ts { color: #888; margin-right: 6px; }
+  #lista-eventos .campos { color: #999; }
+  #lista-eventos .sev-alarma { border-left-color: #f44336; background: #3a1f1f; }
+  #lista-eventos .sev-aviso { border-left-color: #e6a700; background: #332c1a; }
+  #lista-eventos .sev-ok { border-left-color: #4caf50; }
+  #eventos-vacio { color: #666; font-size: 0.85rem; }
 </style>
 </head>
 <body>
@@ -41,6 +52,11 @@
       <button id="btn-clear" disabled>Limpiar falla</button>
       <div id="conexion">conectando...</div>
       <a id="logout" href="/logout">Cerrar sesión</a>
+    </div>
+    <div id="eventos">
+      <h2>Eventos recientes</h2>
+      <div id="eventos-vacio">todavía no llegó ninguno</div>
+      <ul id="lista-eventos"></ul>
     </div>
   </div>
 
@@ -124,6 +140,44 @@ function setEstado(estado) {
   }
 }
 
+// -- eventos (libro de rondas en vivo) --
+// severidad solo para pintar la lista -- la logica real de "esto es una
+// alarma que hay que reconocer" todavia no existe, queda para mas
+// adelante (ver README). Por ahora es nada mas una senal visual.
+const SEVERIDAD_POR_EVENTO = {
+  localizacion_perdida: 'alarma',
+  goal_failed: 'aviso',
+  reiniciado: 'aviso',
+  auto_resume_esperando_localizacion: 'aviso',
+  falla_reconocida: 'ok',
+};
+const MAX_EVENTOS_EN_LISTA = 30;
+
+const eventosVacioDiv = document.getElementById('eventos-vacio');
+const listaEventos = document.getElementById('lista-eventos');
+
+function agregarEvento(data) {
+  eventosVacioDiv.style.display = 'none';
+
+  const li = document.createElement('li');
+  const severidad = SEVERIDAD_POR_EVENTO[data.event] || 'info';
+  li.className = 'sev-' + severidad;
+
+  const hora = (data.ts || '').slice(11, 19) || '--:--:--';
+  const campos = Object.entries(data)
+    .filter(([k]) => !['ts', 'round_id', 'event'].includes(k))
+    .map(([k, v]) => `${k}=${v}`)
+    .join(' ');
+
+  li.innerHTML = `<span class="ts">${hora}</span><strong>${data.event}</strong>` +
+    (campos ? ` <span class="campos">${campos}</span>` : '');
+
+  listaEventos.insertBefore(li, listaEventos.firstChild);
+  while (listaEventos.children.length > MAX_EVENTOS_EN_LISTA) {
+    listaEventos.removeChild(listaEventos.lastChild);
+  }
+}
+
 // -- WebSocket propio contra el backend (server.py) --
 // OJO: esto ya NO es una conexion MQTT directa. El navegador le habla a
 // nuestro propio backend por WebSocket; el backend es el unico que tiene
@@ -188,6 +242,8 @@ ws.onmessage = (event) => {
     draw();
   } else if (msg.type === 'heartbeat') {
     ultimaSenalRobot = Date.now();
+  } else if (msg.type === 'event') {
+    agregarEvento(msg.data);
   }
 };
 

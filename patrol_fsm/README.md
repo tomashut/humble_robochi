@@ -75,6 +75,8 @@ Para leer: es texto plano, una línea por evento — alcanza con `jq` mientras n
 jq 'select(.round_id == "20260807-143210123")' rondas/2026-08-07.jsonl
 ```
 
+Cada línea escrita acá también sale, en el mismo instante y con el mismo JSON, por el tópico ROS `patrol_events` (`std_msgs/String`, QoS volátil — a propósito sin `TRANSIENT_LOCAL`: un evento es un hecho puntual, no un estado, y un suscriptor nuevo no debe recibir el último evento como si acabara de pasar). Esto le da a `comms_agent` un canal de alarmas separado del de estado (`patrol_state`) — ver `comms_agent/README.md`. El JSONL de este archivo sigue siendo el registro autoritativo; el tópico es solo el canal en tiempo real.
+
 ## Persistencia de estado (sobrevive reinicios)
 
 El nodo guarda su estado (`state`, `current_goal`, `fail_count`, `round_id`, `actividad_previa`) en un JSON (`state_file`, default `~/.local/share/patrol_fsm/state.json`) cada vez que algo de eso cambia, con escritura atómica (archivo temporal + rename) para no corromperlo si se corta la luz justo en el medio.

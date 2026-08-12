@@ -49,6 +49,7 @@ class CommsAgentNode(Node):
         self.state_topic = f'{base_topic}/state'
         self.heartbeat_topic = f'{base_topic}/heartbeat'
         self.position_topic = f'{base_topic}/position'
+        self.events_topic = f'{base_topic}/events'
 
         self._service_clients = {
             command: self.create_client(Trigger, service_name)
@@ -64,6 +65,7 @@ class CommsAgentNode(Node):
         state_qos = QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
         self.create_subscription(String, 'patrol_state', self._on_patrol_state, state_qos)
         self.create_subscription(PoseWithCovarianceStamped, 'amcl_pose', self._on_amcl_pose, 10)
+        self.create_subscription(String, 'patrol_events', self._on_patrol_event, 10)
 
         self._mqtt = mqtt.Client()
         if mqtt_username:
@@ -80,7 +82,7 @@ class CommsAgentNode(Node):
             f'Agente listo. Comandos en "{self.cmd_topic}" '
             f'({"/".join(COMMAND_TO_SERVICE.keys())}). '
             f'Estado en "{self.state_topic}". Heartbeat en "{self.heartbeat_topic}". '
-            f'Posicion en "{self.position_topic}".')
+            f'Posicion en "{self.position_topic}". Eventos en "{self.events_topic}".')
 
     # -- MQTT -> ROS --------------------------------------------------------
 
@@ -124,6 +126,14 @@ class CommsAgentNode(Node):
     def _on_patrol_state(self, msg):
         self._last_state = msg.data
         self._mqtt.publish(self.state_topic, msg.data, qos=1, retain=True)
+
+    def _on_patrol_event(self, msg):
+        # sin retain, a proposito: un evento es un hecho puntual ("esto
+        # paso a tal hora"), no un estado -- un panel que se conecta manana
+        # no debe recibir la alarma de anoche como si fuera nueva. La
+        # alarma persiste-hasta-reconocida es responsabilidad del
+        # panel/central, no de este reenvio.
+        self._mqtt.publish(self.events_topic, msg.data, qos=1, retain=False)
 
     def _on_amcl_pose(self, msg):
         position = msg.pose.pose.position
