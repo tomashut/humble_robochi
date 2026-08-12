@@ -34,6 +34,8 @@ Expuesta como servicios ROS 2 (`std_srvs/Trigger`), cada uno valida el estado ac
 
 Reintentos: hasta 5 fallos consecutivos de Nav2 (goal rechazado, abortado, o cancelado sin que lo haya pedido el propio nodo) antes de pasar a `FALLA`.
 
+**Bug real encontrado y corregido en vivo (2026-08-12):** `/start_patrol` no reseteaba `current_goal` — si un `return_to_base` anterior había cortado la ronda a mitad de camino (por ejemplo en el waypoint 3), el índice quedaba guardado ahí en `state.json` para siempre, y la próxima ronda arrancada a mano saltaba directo a ese waypoint intermedio en vez de empezar desde el principio del circuito. Corregido: `handle_start_patrol` ahora resetea `current_goal = 0` junto con `actividad_previa`. No confundir con `INTERRUMPIDO`/`resume_patrol` — ahí sí corresponde retomar exactamente donde quedó, porque es la misma ronda continuando; esto era específicamente el caso de una ronda **nueva**, iniciada a mano desde `EN_BASE`.
+
 `patrol_client.py` es un cliente de terminal interactivo para probar todo esto a mano: `s`/`p`/`r`/`m`/`b`/`c`/`q`. El comando `m` encadena `manual_start` → `teleop_twist_keyboard` → `manual_stop` automáticamente al salir del teleop con Ctrl+C.
 
 Los waypoints se leen de un YAML (`config/waypoints.yaml`, lista plana de `name`/`x`/`y`/`yaw`; el primero es la base) vía el parámetro ROS `waypoints_file`. Sin acciones por punto ni agenda todavía — eso es alcance futuro, cuando haya algo real que las use. Si el archivo falta o está mal formado, el nodo falla al arrancar en vez de arrancar en silencio con datos por defecto.

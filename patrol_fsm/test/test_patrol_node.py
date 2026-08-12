@@ -8,6 +8,7 @@ depender de una simulacion levantada.
 """
 
 import json
+from datetime import date
 
 import yaml
 import pytest
@@ -566,5 +567,58 @@ def test_actividad_previa_se_limpia_al_iniciar_ronda_nueva(tmp_path, rclpy_conte
         node.handle_start_patrol(Trigger.Request(), Trigger.Response())
 
         assert node.actividad_previa is None
+    finally:
+        node.destroy_node()
+
+
+# -- canal de eventos (patrol_events) ----------------------------------------
+
+def test_log_event_publica_en_patrol_events_lo_mismo_que_el_jsonl(tmp_path, rclpy_context):
+    """_log_event() saca el mismo payload por el topico que el que escribe al log."""
+    node = make_node(tmp_path, rclpy_context)
+    try:
+        published = []
+        node._events_pub.publish = published.append
+
+        node.handle_start_patrol(Trigger.Request(), Trigger.Response())
+
+        assert len(published) == 1
+        payload = json.loads(published[0].data)
+        assert payload['event'] == 'round_started'
+        assert payload['round_id'] == node.round_id
+
+        log_path = tmp_path / 'rondas' / f'{date.today().isoformat()}.jsonl'
+        last_line = log_path.read_text().strip().splitlines()[-1]
+        assert json.loads(last_line) == payload
+    finally:
+        node.destroy_node()
+
+
+# -- una ronda nueva no hereda el indice de una ronda anterior ---------------
+
+def test_ronda_nueva_no_hereda_el_current_goal_de_un_retorno_a_mitad_de_camino(
+        tmp_path, rclpy_context):
+    """
+    Reproduce el bug real encontrado en vivo el 2026-08-12.
+
+    Un return_to_base a mitad de camino no reseteaba current_goal, asi que
+    la siguiente ronda arrancaba directo en ese waypoint intermedio en vez
+    de en el primero.
+    """
+    node = make_node(tmp_path, rclpy_context)
+    try:
+        node.handle_start_patrol(Trigger.Request(), Trigger.Response())
+        node.current_goal = 2  # simula haber avanzado varios waypoints
+
+        node.handle_return_to_base(Trigger.Request(), Trigger.Response())
+        assert node.state == PatrolState.RETORNO
+
+        node._current_goal_handle = FakeGoalHandle()
+        node.get_result_callback(FakeResultFuture(GoalStatus.STATUS_SUCCEEDED))
+        assert node.state == PatrolState.EN_BASE
+
+        node.handle_start_patrol(Trigger.Request(), Trigger.Response())
+
+        assert node.current_goal == 0
     finally:
         node.destroy_node()

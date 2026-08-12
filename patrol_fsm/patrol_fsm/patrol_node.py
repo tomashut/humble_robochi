@@ -511,6 +511,11 @@ class PatrolNode(Node):
         # defensivo: cubre cualquier camino a EN_BASE que no la haya limpiado
         # ya (por ejemplo, /clear_failure tras una FALLA).
         self.actividad_previa = None
+        # una ronda nueva arranca desde el principio del circuito, no desde
+        # donde haya quedado current_goal de una ronda anterior -- si no,
+        # un return_to_base a mitad de camino deja el indice a mitad de
+        # camino para siempre, y la proxima ronda salta directo ahi.
+        self.current_goal = 0
         self._enter_state(PatrolState.EN_RONDA)
         self._start_round()
         self.send_next_goal()
