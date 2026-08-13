@@ -16,7 +16,7 @@ from action_msgs.msg import GoalStatus
 from ament_index_python.packages import get_package_share_directory
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 from nav2_msgs.action import NavigateToPose, Spin
-from std_msgs.msg import String
+from std_msgs.msg import Bool, String
 from std_srvs.srv import Trigger
 from tf_transformations import quaternion_from_euler
 
@@ -100,6 +100,22 @@ class PatrolNode(Node):
             .get_parameter_value().integer_value)
         self._lecturas_amcl_malas_seguidas = 0
 
+        # que hacer si se corta el enlace comms_agent<->Mosquitto por mucho
+        # tiempo -- 'continue' (default) sigue patrullando sin reportar,
+        # 'return_to_base'/'pause' reaccionan solo despues de
+        # link_loss_grace_sec sin recuperarse. Ortogonal a la maquina de
+        # estados (no es un estado ni una FALLA): el robot puede estar
+        # EN_RONDA con o sin enlace, y la recuperacion es automatica al
+        # volver la conexion, no requiere un humano.
+        self.declare_parameter('on_link_loss', 'continue')
+        self.on_link_loss = self.get_parameter('on_link_loss').get_parameter_value().string_value
+        self.declare_parameter('link_loss_grace_sec', 600)
+        self.link_loss_grace_sec = (
+            self.get_parameter('link_loss_grace_sec').get_parameter_value().integer_value)
+        self._link_ok = True
+        self._link_lost_at = None
+        self._link_loss_grace_timer = None
+
         saved_state = self._load_saved_state()
         if saved_state is None:
             self.current_goal = 0
@@ -130,6 +146,11 @@ class PatrolNode(Node):
 
         self.create_subscription(
             PoseWithCovarianceStamped, 'amcl_pose', self._on_amcl_pose, 10)
+        # TRANSIENT_LOCAL, igual que patrol_state pero al reves: si
+        # patrol_node arranca despues que comms_agent, se entera del ultimo
+        # estado de enlace conocido sin esperar el proximo cambio.
+        link_qos = QoSProfile(depth=1, durability=QoSDurabilityPolicy.TRANSIENT_LOCAL)
+        self.create_subscription(Bool, 'link_status', self._on_link_status, link_qos)
 
         self._action_client = ActionClient(self, NavigateToPose, 'navigate_to_pose')
         self._spin_action_client = ActionClient(self, Spin, 'spin')
@@ -260,6 +281,55 @@ class PatrolNode(Node):
         if self._auto_resume_timer is not None:
             self._auto_resume_timer.cancel()
             self._auto_resume_timer = None
+
+    # -- enlace comms_agent<->Mosquitto --------------------------------------
+
+    def _on_link_status(self, msg):
+        if msg.data == self._link_ok:
+            return  # sin cambio real (o eco), no hay nada que hacer
+
+        self._link_ok = msg.data
+        if not self._link_ok:
+            self._link_lost_at = datetime.now()
+            self.get_logger().warn('Se perdio el enlace hacia Mosquitto.')
+            self._log_event('enlace_perdido')
+            self._schedule_link_loss_grace()
+        else:
+            duracion_sec = (datetime.now() - self._link_lost_at).total_seconds()
+            self.get_logger().info(f'Enlace restablecido tras {duracion_sec:.0f}s.')
+            self._log_event('enlace_restablecido', duracion_sec=round(duracion_sec, 1))
+            self._link_lost_at = None
+            self._cancel_link_loss_grace()
+
+    def _schedule_link_loss_grace(self):
+        if self.link_loss_grace_sec <= 0:
+            return
+        self._link_loss_grace_timer = self.create_timer(
+            float(self.link_loss_grace_sec), self._on_link_loss_grace_expired)
+
+    def _cancel_link_loss_grace(self):
+        if self._link_loss_grace_timer is not None:
+            self._link_loss_grace_timer.cancel()
+            self._link_loss_grace_timer = None
+
+    def _on_link_loss_grace_expired(self):
+        self._cancel_link_loss_grace()
+        if self._link_ok:
+            return  # se recupero justo antes de que este timer disparara
+
+        # se comunica siempre, aunque la politica sea 'continue' -- alguien
+        # mirando el panel en vivo deberia poder distinguir un corte breve
+        # de uno que ya lleva rato, aunque el robot no cambie de conducta.
+        self._log_event('enlace_perdido_prolongado')
+
+        if self.state != PatrolState.EN_RONDA:
+            return  # nada que "continuar" o "volver" desde otro estado
+
+        if self.on_link_loss == 'return_to_base':
+            self.handle_return_to_base(Trigger.Request(), Trigger.Response())
+        elif self.on_link_loss == 'pause':
+            self.handle_pause_patrol(Trigger.Request(), Trigger.Response())
+        # 'continue' (default): no hace nada mas alla del evento de arriba.
 
     def _on_amcl_pose(self, msg):
         cov = msg.pose.covariance

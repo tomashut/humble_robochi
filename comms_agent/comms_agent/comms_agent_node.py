@@ -7,7 +7,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSDurabilityPolicy
 from geometry_msgs.msg import PoseWithCovarianceStamped
-from std_msgs.msg import String
+from std_msgs.msg import Bool, String
 from std_srvs.srv import Trigger
 
 
@@ -66,11 +66,17 @@ class CommsAgentNode(Node):
         self.create_subscription(String, 'patrol_state', self._on_patrol_state, state_qos)
         self.create_subscription(PoseWithCovarianceStamped, 'amcl_pose', self._on_amcl_pose, 10)
         self.create_subscription(String, 'patrol_events', self._on_patrol_event, 10)
+        # TRANSIENT_LOCAL para que patrol_node se entere del ultimo estado de
+        # enlace conocido aunque arranque despues -- el broker en si es el
+        # proxy de "hay enlace hacia la central" (vive del otro lado del
+        # WireGuard en produccion).
+        self._link_status_pub = self.create_publisher(Bool, 'link_status', state_qos)
 
         self._mqtt = mqtt.Client()
         if mqtt_username:
             self._mqtt.username_pw_set(mqtt_username, mqtt_password)
         self._mqtt.on_connect = self._on_mqtt_connect
+        self._mqtt.on_disconnect = self._on_mqtt_disconnect
         self._mqtt.on_message = self._on_mqtt_message
         self.get_logger().info(f'Conectando a Mosquitto en {mqtt_host}:{mqtt_port}...')
         # connect_async (en vez de connect) no hace el handshake TCP aca mismo
@@ -97,6 +103,7 @@ class CommsAgentNode(Node):
             return
         client.subscribe(self.cmd_topic, qos=1)
         self.get_logger().info(f'Conectado a Mosquitto, suscripto a "{self.cmd_topic}".')
+        self._link_status_pub.publish(Bool(data=True))
 
         # si esto es una reconexion, ROS ya nos pudo haber avisado cambios
         # mientras estabamos desconectados de Mosquitto -- los reenviamos
@@ -105,6 +112,10 @@ class CommsAgentNode(Node):
             client.publish(self.state_topic, self._last_state, qos=1, retain=True)
         if self._last_position is not None:
             client.publish(self.position_topic, self._last_position, qos=1, retain=True)
+
+    def _on_mqtt_disconnect(self, client, userdata, rc):
+        self.get_logger().warn(f'Desconectado de Mosquitto (rc={rc}).')
+        self._link_status_pub.publish(Bool(data=False))
 
     def _on_mqtt_message(self, client, userdata, msg):
         command = msg.payload.decode('utf-8').strip()

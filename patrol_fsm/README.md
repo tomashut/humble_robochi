@@ -72,6 +72,9 @@ El nodo escribe un JSON Lines por día (`rounds_log_dir`, default `~/.local/shar
 | `guardado_estado_fallido` | `_save_state()` no pudo escribir `state.json` (disco lleno/solo-lectura). El robot sigue andando igual. | `error` |
 | `disco_casi_lleno` | El espacio libre en disco cayó por debajo de `disk_free_warning_pct` (default 10%). Una sola vez por caída, no en cada chequeo. | `libre_pct` |
 | `disco_normalizado` | El espacio libre volvió a estar por encima del umbral tras un `disco_casi_lleno`. | `libre_pct` |
+| `enlace_perdido` | `comms_agent` avisó (tópico `link_status`) que se cortó el enlace a Mosquitto. | — |
+| `enlace_perdido_prolongado` | El corte sigue activo tras `link_loss_grace_sec` (default 600s = 10 min) sin recuperarse. Se dispara siempre, sea cual sea `on_link_loss`. | — |
+| `enlace_restablecido` | El enlace volvió. | `duracion_sec` |
 
 **Qué define una "ronda":** una vuelta completa al circuito de waypoints (del primero al último y de nuevo al principio), no un día completo de patrullaje (eso es la "sesión" = el archivo diario, que puede contener muchas rondas). Pausas y modo manual son interrupciones dentro de la misma ronda; un `return_to_base` exitoso, en cambio, la cierra — porque puede quedarse ahí un tiempo indefinido (cargando) y no queremos una ronda "abierta" cruzando archivos de varios días.
 
@@ -125,6 +128,21 @@ Tres capas, probadas en vivo en la simulación, no solo en teoría:
 **Límite conocido y aceptado, no una falla de diseño:** las tres capas juntas todavía necesitan que el robot se mueva un poco (~15-20s en las pruebas) antes de poder detectar una localización falsa — no hay forma de saberlo con el robot parado, solo moviéndose. Durante esa ventana, el evitar-obstáculos local de Nav2 (basado en el láser en tiempo real, independiente de si AMCL sabe bien la posición global) sigue protegiendo contra chocar con algo que tenga físicamente cerca — pero no contra lo que un láser 2D no puede ver (pozos, escalones). El chequeo que cerraría esto del todo sin necesitar moverse (comparar el láser contra el mapa directamente) queda pendiente para cuando esté el robot físico.
 
 **Otro límite conocido, encontrado en vivo el mismo día:** una pose que pasa el chequeo de covarianza es "lo suficientemente segura como para intentar", no "perfectamente exacta" — puede tener un error real de algunos centímetros, suficiente para que el robot crea que un hueco angosto (una puerta, una esquina justa) es pasable cuando en realidad no le entra, y termine chocando o reintentando sin éxito ahí. Ni el gate ni el evitar-obstáculos local de Nav2 cubren completamente este caso intermedio. Sin diseño todavía.
+
+### Qué hace el robot si pierde el enlace hacia la central (implementado 2026-08-13)
+
+`comms_agent` avisa a `patrol_node` (tópico ROS `link_status`, ver `comms_agent/README.md`) cuando se corta o se recupera su conexión a Mosquitto. La pregunta de fondo, investigada contra cómo lo resuelve la industria (patrones de "retro-traverse" en robots teleoperados, y la estrategia de auto-reparación de RCAMP para robots autónomos): ¿qué vale más durante un corte, un robot patrullando sin reportar o un robot quieto/volviendo a base? Para un servicio de seguridad, la respuesta elegida es **patrullando**: la disuasión (robot visible, moviéndose) sigue funcionando sin red, y el libro de rondas sigue escribiéndose a disco — cuando vuelve el enlace, la evidencia de que las rondas se hicieron está completa. Una política que frena la patrulla ante cualquier corte le regala a un intruso un método barato (cortar el WiFi apaga la ronda), y eso es un agujero de diseño en un producto de seguridad, no una salvaguarda.
+
+**Dos decisiones de diseño, para que no se malinterprete si se retoca esto:**
+1. **La pérdida de enlace no es un estado de la FSM ni una `FALLA`.** Es una condición ortogonal a la actividad — el robot puede estar `EN_RONDA` con o sin enlace. Meterla como estado duplicaría la máquina entera; y no es `FALLA` porque no hay nada roto que un humano deba limpiar — la recuperación es automática en cuanto vuelve el enlace.
+2. **Si la política manda a `RETORNO` y el enlace se recupera a mitad de camino, no pasa nada automático** — termina de volver a base igual, la central ve el estado resincronizado (ver `comms_agent/README.md`) y decide si relanza la ronda. Evita el mismo problema de "reanudaciones automáticas en cadena" que ya se pensó para `INTERRUMPIDO`.
+
+**Parámetros** (`on_link_loss`, default `continue`; `link_loss_grace_sec`, default `600` = 10 min):
+- `continue` (default): no cambia nada del comportamiento del robot. Sigue patrullando.
+- `return_to_base`: si el corte supera `link_loss_grace_sec`, vuelve a base (que suele estar cerca del punto de acceso a la red — la versión práctica de "moverse hacia una posición con conexión segura").
+- `pause`: se detiene donde está. Documentado pero no recomendado — robot quieto e invisible para la central es lo peor de los tres casos.
+
+La política solo actúa si el robot está `EN_RONDA` en ese momento (desde `PAUSADO`/`MANUAL`/`FALLA`/`EN_BASE` no hay nada que "continuar" o "volver"). El evento `enlace_perdido_prolongado`, en cambio, se dispara siempre que se cumple el umbral, **incluso con la política en `continue`** — es puramente para que el panel lo marque con más urgencia si alguien está mirando en vivo, no dispara ninguna acción por sí solo.
 
 ## Comportamientos no obvios (aprendidos probando en simulación)
 

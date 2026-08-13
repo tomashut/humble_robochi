@@ -17,6 +17,7 @@ import rclpy
 from rclpy.parameter import Parameter
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PoseWithCovarianceStamped
+from std_msgs.msg import Bool
 from std_srvs.srv import Trigger
 
 import patrol_fsm.patrol_node as patrol_node_module
@@ -714,5 +715,140 @@ def test_avisa_cuando_el_disco_esta_por_llenarse(tmp_path, rclpy_context, monkey
 
         eventos = [json.loads(p.data)['event'] for p in published]
         assert eventos.count('disco_normalizado') == 1
+    finally:
+        node.destroy_node()
+
+
+# -- enlace comms_agent<->Mosquitto ------------------------------------------
+
+def link_msg(ok):
+    msg = Bool()
+    msg.data = ok
+    return msg
+
+
+def test_enlace_perdido_se_loguea_y_agenda_la_gracia(tmp_path, rclpy_context):
+    node = make_node(tmp_path, rclpy_context)
+    try:
+        published = []
+        node._events_pub.publish = published.append
+
+        node._on_link_status(link_msg(False))
+
+        assert node._link_ok is False
+        assert node._link_loss_grace_timer is not None
+        eventos = [json.loads(p.data)['event'] for p in published]
+        assert eventos == ['enlace_perdido']
+    finally:
+        node.destroy_node()
+
+
+def test_enlace_restablecido_antes_de_la_gracia_cancela_el_timer(tmp_path, rclpy_context):
+    node = make_node(tmp_path, rclpy_context)
+    try:
+        published = []
+        node._events_pub.publish = published.append
+
+        node._on_link_status(link_msg(False))
+        node._on_link_status(link_msg(True))
+
+        assert node._link_ok is True
+        assert node._link_loss_grace_timer is None
+        eventos = [json.loads(p.data)['event'] for p in published]
+        assert eventos == ['enlace_perdido', 'enlace_restablecido']
+    finally:
+        node.destroy_node()
+
+
+def test_gracia_vencida_con_politica_continue_solo_avisa(tmp_path, rclpy_context):
+    """
+    La politica 'continue' (default) no cambia el comportamiento del robot.
+
+    Solo se dispara el evento de aviso -- pensado para que el panel lo
+    marque con mas urgencia si alguien esta mirando en vivo.
+    """
+    node = make_node(tmp_path, rclpy_context, on_link_loss='continue')
+    try:
+        node.handle_start_patrol(Trigger.Request(), Trigger.Response())
+        published = []
+        node._events_pub.publish = published.append
+
+        node._on_link_status(link_msg(False))
+        node._on_link_loss_grace_expired()
+
+        assert node.state == PatrolState.EN_RONDA
+        eventos = [json.loads(p.data)['event'] for p in published]
+        assert 'enlace_perdido_prolongado' in eventos
+    finally:
+        node.destroy_node()
+
+
+def test_gracia_vencida_con_politica_return_to_base_retorna(tmp_path, rclpy_context):
+    node = make_node(tmp_path, rclpy_context, on_link_loss='return_to_base')
+    try:
+        node.handle_start_patrol(Trigger.Request(), Trigger.Response())
+
+        node._on_link_status(link_msg(False))
+        node._on_link_loss_grace_expired()
+
+        assert node.state == PatrolState.RETORNO
+    finally:
+        node.destroy_node()
+
+
+def test_gracia_vencida_con_politica_pause_pausa(tmp_path, rclpy_context):
+    node = make_node(tmp_path, rclpy_context, on_link_loss='pause')
+    try:
+        node.handle_start_patrol(Trigger.Request(), Trigger.Response())
+
+        node._on_link_status(link_msg(False))
+        node._on_link_loss_grace_expired()
+
+        assert node.state == PatrolState.PAUSADO
+    finally:
+        node.destroy_node()
+
+
+def test_gracia_vencida_fuera_de_en_ronda_no_hace_nada(tmp_path, rclpy_context):
+    """
+    La politica de enlace no actua fuera de EN_RONDA.
+
+    Si el robot ya estaba PAUSADO por otro motivo cuando se cumple la
+    gracia, no hay nada que "continuar" o "volver" -- no debe tocar el
+    estado.
+    """
+    node = make_node(tmp_path, rclpy_context, on_link_loss='return_to_base')
+    try:
+        node.handle_start_patrol(Trigger.Request(), Trigger.Response())
+        node.handle_pause_patrol(Trigger.Request(), Trigger.Response())
+
+        node._on_link_status(link_msg(False))
+        node._on_link_loss_grace_expired()
+
+        assert node.state == PatrolState.PAUSADO
+    finally:
+        node.destroy_node()
+
+
+def test_gracia_vencida_luego_de_recuperado_no_hace_nada(tmp_path, rclpy_context):
+    """
+    Corrida tardia del timer tras haberse recuperado el enlace es un no-op.
+
+    Cubre la carrera donde el timer ya estaba agendado para correr y el
+    enlace se recupera justo antes.
+    """
+    node = make_node(tmp_path, rclpy_context, on_link_loss='return_to_base')
+    try:
+        node.handle_start_patrol(Trigger.Request(), Trigger.Response())
+        published = []
+        node._events_pub.publish = published.append
+
+        node._on_link_status(link_msg(False))
+        node._on_link_status(link_msg(True))
+        node._on_link_loss_grace_expired()
+
+        assert node.state == PatrolState.EN_RONDA
+        eventos = [json.loads(p.data)['event'] for p in published]
+        assert 'enlace_perdido_prolongado' not in eventos
     finally:
         node.destroy_node()

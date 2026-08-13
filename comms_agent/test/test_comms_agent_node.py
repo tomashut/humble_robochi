@@ -101,3 +101,36 @@ def test_no_publica_nada_si_nunca_hubo_estado(rclpy_context):
         assert state_publishes == []
     finally:
         node.destroy_node()
+
+
+def test_avisa_link_status_true_al_conectar(rclpy_context):
+    """
+    _on_mqtt_connect publica True en link_status.
+
+    No se asume que sea la unica publicacion: el cliente MQTT real de
+    make_node tambien se conecta de verdad en segundo plano (ver docstring
+    del modulo) y puede publicar su propio True concurrentemente.
+    """
+    node = make_node(rclpy_context)
+    try:
+        published = []
+        node._link_status_pub.publish = published.append
+
+        node._on_mqtt_connect(FakeMqttClient(), None, None, 0)
+
+        assert any(m.data is True for m in published)
+    finally:
+        node.destroy_node()
+
+
+def test_avisa_link_status_false_al_desconectar(rclpy_context):
+    node = make_node(rclpy_context)
+    try:
+        published = []
+        node._link_status_pub.publish = published.append
+
+        node._on_mqtt_disconnect(node._mqtt, None, 1)
+
+        assert any(m.data is False for m in published)
+    finally:
+        node.destroy_node()
