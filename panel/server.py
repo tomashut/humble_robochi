@@ -206,7 +206,11 @@ def make_mqtt_client(app, loop, host, port, username, password):
 
     client.on_connect = on_connect
     client.on_message = on_message
-    client.connect(host, port)
+    # connect_async (en vez de connect) no hace el handshake TCP aca mismo --
+    # lo delega al loop de background, que reintenta solo. Con connect(),
+    # Mosquitto no estando listo justo cuando arranca server.py tira una
+    # excepcion sin capturar que mata on_startup y con el todo aiohttp.
+    client.connect_async(host, port)
     client.loop_start()
     return client
 
