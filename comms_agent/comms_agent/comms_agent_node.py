@@ -73,7 +73,12 @@ class CommsAgentNode(Node):
         self._mqtt.on_connect = self._on_mqtt_connect
         self._mqtt.on_message = self._on_mqtt_message
         self.get_logger().info(f'Conectando a Mosquitto en {mqtt_host}:{mqtt_port}...')
-        self._mqtt.connect(mqtt_host, mqtt_port)
+        # connect_async (en vez de connect) no hace el handshake TCP aca mismo
+        # -- lo delega al loop de background, que reintenta solo. Si usaramos
+        # connect(), Mosquitto no estando listo en este instante (reinicio no
+        # atendido del robot, por ejemplo) tira una excepcion sin capturar que
+        # mata el nodo entero antes de arrancar.
+        self._mqtt.connect_async(mqtt_host, mqtt_port)
         self._mqtt.loop_start()
 
         self.create_timer(heartbeat_interval_sec, self._publish_heartbeat)
