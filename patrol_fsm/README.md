@@ -69,6 +69,9 @@ El nodo escribe un JSON Lines por día (`rounds_log_dir`, default `~/.local/shar
 | `auto_resume_girando_para_converger` | Desde `INTERRUMPIDO`, se cumplió el timeout y arranca el giro de convergencia antes de decidir. | — |
 | `auto_resume_esperando_localizacion` | El giro terminó pero la localización sigue sin ser confiable — no reanuda, reintenta en el próximo ciclo. | — |
 | `localizacion_perdida` | La vigilancia continua detectó que se perdió la confianza en AMCL mientras navegaba (`EN_RONDA`/`RETORNO`) — pasa a `FALLA`. | `estado` (desde cuál de los dos) |
+| `guardado_estado_fallido` | `_save_state()` no pudo escribir `state.json` (disco lleno/solo-lectura). El robot sigue andando igual. | `error` |
+| `disco_casi_lleno` | El espacio libre en disco cayó por debajo de `disk_free_warning_pct` (default 10%). Una sola vez por caída, no en cada chequeo. | `libre_pct` |
+| `disco_normalizado` | El espacio libre volvió a estar por encima del umbral tras un `disco_casi_lleno`. | `libre_pct` |
 
 **Qué define una "ronda":** una vuelta completa al circuito de waypoints (del primero al último y de nuevo al principio), no un día completo de patrullaje (eso es la "sesión" = el archivo diario, que puede contener muchas rondas). Pausas y modo manual son interrupciones dentro de la misma ronda; un `return_to_base` exitoso, en cambio, la cierra — porque puede quedarse ahí un tiempo indefinido (cargando) y no queremos una ronda "abierta" cruzando archivos de varios días.
 
@@ -82,6 +85,10 @@ Cada línea escrita acá también sale, en el mismo instante y con el mismo JSON
 ## Persistencia de estado (sobrevive reinicios)
 
 El nodo guarda su estado (`state`, `current_goal`, `fail_count`, `round_id`, `actividad_previa`) en un JSON (`state_file`, default `~/.local/share/patrol_fsm/state.json`) cada vez que algo de eso cambia, con escritura atómica (archivo temporal + rename) para no corromperlo si se corta la luz justo en el medio.
+
+**Resiliente a disco lleno/solo-lectura (2026-08-13).** `_save_state()` se llama desde adentro de callbacks de acción de Nav2 — si la escritura fallara con una excepción sin capturar (disco lleno, tarjeta SD en modo solo-lectura, algo real en una Raspberry Pi que lleva meses prendida), esa excepción mataría el nodo entero en medio de una ronda, sin pasar por `FALLA`, sin loguear nada, sin avisar a nadie: justo el "queda mudo" que el proyecto busca evitar. Ahora la escritura está en un try/except: si falla, el robot sigue andando (un reinicio en ese momento retomaría con estado desactualizado, riesgo ya conocido, ver más abajo) y se dispara un evento `guardado_estado_fallido` por el canal de eventos (`patrol_events`/`.../events`, ver más abajo). `_log_event()` en sí también quedó blindado — si el JSONL de rondas tampoco se puede escribir, igual publica el evento por el tópico ROS, para que `guardado_estado_fallido` no termine fallando al intentar registrarse a sí mismo.
+
+**Aviso preventivo antes de llegar a ese punto.** Un chequeo periódico (`_check_disk_space`, cada `DISK_CHECK_INTERVAL_SEC`=60s) mide el espacio libre en el disco donde vive `state_file` y dispara un evento `disco_casi_lleno` si cae por debajo de `disk_free_warning_pct` (parámetro, default 10%) — una sola vez mientras se mantenga por debajo del umbral (no en cada chequeo), y un `disco_normalizado` cuando se recupera.
 
 Al arrancar, según el estado guardado:
 

@@ -19,6 +19,7 @@ from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PoseWithCovarianceStamped
 from std_srvs.srv import Trigger
 
+import patrol_fsm.patrol_node as patrol_node_module
 from patrol_fsm.patrol_node import PatrolNode, PatrolState
 
 
@@ -80,6 +81,14 @@ class FakeGoalHandle:
 
     def cancel_goal_async(self):
         pass
+
+
+class FakeDiskUsage:
+    """Reemplaza el resultado de shutil.disk_usage() sin tocar el disco real."""
+
+    def __init__(self, total, free):
+        self.total = total
+        self.free = free
 
 
 class FakeResultFuture:
@@ -620,5 +629,90 @@ def test_ronda_nueva_no_hereda_el_current_goal_de_un_retorno_a_mitad_de_camino(
         node.handle_start_patrol(Trigger.Request(), Trigger.Response())
 
         assert node.current_goal == 0
+    finally:
+        node.destroy_node()
+
+
+# -- resiliencia ante disco lleno / solo-lectura -----------------------------
+
+def test_save_state_no_crashea_si_no_puede_escribir_en_disco(tmp_path, rclpy_context):
+    """
+    Simula disco lleno/solo-lectura para el archivo de estado.
+
+    _save_state no debe dejar escapar la excepcion (mataria el nodo entero,
+    ya que se llama desde un callback de accion), sino avisar via un evento.
+    """
+    node = make_node(tmp_path, rclpy_context)
+    try:
+        published = []
+        node._events_pub.publish = published.append
+
+        node.state_file.parent.chmod(0o500)
+        try:
+            node._save_state()
+        finally:
+            node.state_file.parent.chmod(0o700)
+
+        eventos = [json.loads(p.data)['event'] for p in published]
+        assert 'guardado_estado_fallido' in eventos
+    finally:
+        node.destroy_node()
+
+
+def test_log_event_publica_igual_si_no_puede_escribir_el_jsonl(tmp_path, rclpy_context):
+    """
+    _log_event tiene que publicar el evento aunque el JSONL falle.
+
+    Si ADEMAS el JSONL de rondas tampoco se puede escribir (disco lleno de
+    verdad, no solo el archivo de estado), el evento tiene que llegar igual
+    por el topico -- si no, guardado_estado_fallido terminaria fallando
+    tambien al intentar registrarse a si mismo, sin avisarle a nadie.
+    """
+    node = make_node(tmp_path, rclpy_context)
+    try:
+        published = []
+        node._events_pub.publish = published.append
+
+        node.rounds_log_dir.chmod(0o500)
+        try:
+            node._log_event('evento_de_prueba')
+        finally:
+            node.rounds_log_dir.chmod(0o700)
+
+        assert len(published) == 1
+        assert json.loads(published[0].data)['event'] == 'evento_de_prueba'
+    finally:
+        node.destroy_node()
+
+
+def test_avisa_cuando_el_disco_esta_por_llenarse(tmp_path, rclpy_context, monkeypatch):
+    """
+    Aviso preventivo antes de que el disco se llene de verdad.
+
+    Un chequeo periodico detecta poco espacio libre y dispara un evento --
+    una sola vez mientras siga por debajo del umbral, y otro cuando se
+    normaliza.
+    """
+    node = make_node(tmp_path, rclpy_context, disk_free_warning_pct=10.0)
+    try:
+        published = []
+        node._events_pub.publish = published.append
+
+        monkeypatch.setattr(
+            patrol_node_module.shutil, 'disk_usage',
+            lambda path: FakeDiskUsage(total=100, free=5))
+        node._check_disk_space()
+        node._check_disk_space()  # no debe repetir el aviso mientras sigue en alerta
+
+        eventos = [json.loads(p.data)['event'] for p in published]
+        assert eventos.count('disco_casi_lleno') == 1
+
+        monkeypatch.setattr(
+            patrol_node_module.shutil, 'disk_usage',
+            lambda path: FakeDiskUsage(total=100, free=50))
+        node._check_disk_space()
+
+        eventos = [json.loads(p.data)['event'] for p in published]
+        assert eventos.count('disco_normalizado') == 1
     finally:
         node.destroy_node()

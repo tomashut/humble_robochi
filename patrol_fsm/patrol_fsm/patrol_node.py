@@ -1,5 +1,6 @@
 import json
 import math
+import shutil
 from datetime import date, datetime
 from enum import Enum
 from pathlib import Path
@@ -37,6 +38,7 @@ class PatrolNode(Node):
     MAX_RETRIES = 5
     RETRY_DELAY_SEC = 1.0
     NEXT_WAYPOINT_DELAY_SEC = 1.0
+    DISK_CHECK_INTERVAL_SEC = 60.0
 
     def __init__(self, wait_for_nav2=True, **kwargs):
         super().__init__('patrol_node', **kwargs)
@@ -58,6 +60,15 @@ class PatrolNode(Node):
         state_file = self.get_parameter('state_file').get_parameter_value().string_value
         self.state_file = Path(state_file).expanduser()
         self.state_file.parent.mkdir(parents=True, exist_ok=True)
+
+        # aviso preventivo de disco casi lleno -- avisa ANTES de que
+        # _save_state/_log_event empiecen a fallar de verdad, no solo cuando
+        # ya paso.
+        self.declare_parameter('disk_free_warning_pct', 10.0)
+        self.disk_free_warning_pct = (
+            self.get_parameter('disk_free_warning_pct').get_parameter_value().double_value)
+        self._disco_en_alerta = False
+        self.create_timer(self.DISK_CHECK_INTERVAL_SEC, self._check_disk_space)
 
         self.declare_parameter('auto_resume_timeout_sec', 300)
         self.auto_resume_timeout_sec = (
@@ -373,9 +384,31 @@ class PatrolNode(Node):
             'actividad_previa': self.actividad_previa,
         }
         tmp_path = self.state_file.with_suffix('.tmp')
-        with open(tmp_path, 'w') as f:
-            json.dump(payload, f)
-        tmp_path.replace(self.state_file)
+        try:
+            with open(tmp_path, 'w') as f:
+                json.dump(payload, f)
+            tmp_path.replace(self.state_file)
+        except OSError as e:
+            # disco lleno/solo-lectura no debe matar el nodo -- el robot
+            # sigue andando, solo que un reinicio en este momento retomaria
+            # con un estado desactualizado. _log_event publica el aviso
+            # igual aunque el JSONL tampoco se pueda escribir (ver abajo).
+            self.get_logger().error(f'No se pudo guardar el estado en disco: {e}')
+            self._log_event('guardado_estado_fallido', error=str(e))
+
+    def _check_disk_space(self):
+        try:
+            uso = shutil.disk_usage(self.state_file.parent)
+        except OSError:
+            return
+        libre_pct = 100.0 * uso.free / uso.total
+        if libre_pct < self.disk_free_warning_pct and not self._disco_en_alerta:
+            self._disco_en_alerta = True
+            self.get_logger().warn(f'Poco espacio libre en disco: {libre_pct:.1f}%.')
+            self._log_event('disco_casi_lleno', libre_pct=round(libre_pct, 1))
+        elif libre_pct >= self.disk_free_warning_pct and self._disco_en_alerta:
+            self._disco_en_alerta = False
+            self._log_event('disco_normalizado', libre_pct=round(libre_pct, 1))
 
     # -- registro de rondas ("libro de rondas digital") -----------------------
 
@@ -387,9 +420,16 @@ class PatrolNode(Node):
         }
         entry.update(fields)
 
+        # intenta guardar en el JSONL, pero si el disco esta lleno no deja
+        # que eso le impida publicar el evento por el topico -- si no, un
+        # guardado_estado_fallido disparado desde _save_state por disco
+        # lleno terminaria fallando aca tambien, sin avisarle a nadie.
         log_path = self.rounds_log_dir / f'{date.today().isoformat()}.jsonl'
-        with open(log_path, 'a') as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+        try:
+            with open(log_path, 'a') as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + '\n')
+        except OSError as e:
+            self.get_logger().error(f'No se pudo escribir el registro de rondas: {e}')
 
         # mismo payload que la linea del log -- garantia de coherencia entre
         # lo que queda escrito y lo que sale por el topico.
