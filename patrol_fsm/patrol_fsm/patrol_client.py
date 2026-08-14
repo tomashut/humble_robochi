@@ -63,8 +63,11 @@ class PatrolClient(Node):
 
     def run_teleop(self):
         self.get_logger().info('Iniciando teleop. Ctrl+C para volver a pausa.')
+        # remapeado a cmd_vel_teleop, no al /cmd_vel final -- lo arbitra
+        # twist_mux (robot_bringup) contra Nav2, con dead-man timer.
         teleop = subprocess.Popen(
-            ['ros2', 'run', 'teleop_twist_keyboard', 'teleop_twist_keyboard'],
+            ['ros2', 'run', 'teleop_twist_keyboard', 'teleop_twist_keyboard',
+             '--ros-args', '--remap', 'cmd_vel:=cmd_vel_teleop'],
             preexec_fn=os.setsid,
         )
         try:

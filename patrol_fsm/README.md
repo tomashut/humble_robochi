@@ -36,7 +36,7 @@ Reintentos: hasta 5 fallos consecutivos de Nav2 (goal rechazado, abortado, o can
 
 **Bug real encontrado y corregido en vivo (2026-08-12):** `/start_patrol` no reseteaba `current_goal` — si un `return_to_base` anterior había cortado la ronda a mitad de camino (por ejemplo en el waypoint 3), el índice quedaba guardado ahí en `state.json` para siempre, y la próxima ronda arrancada a mano saltaba directo a ese waypoint intermedio en vez de empezar desde el principio del circuito. Corregido: `handle_start_patrol` ahora resetea `current_goal = 0` junto con `actividad_previa`. No confundir con `INTERRUMPIDO`/`resume_patrol` — ahí sí corresponde retomar exactamente donde quedó, porque es la misma ronda continuando; esto era específicamente el caso de una ronda **nueva**, iniciada a mano desde `EN_BASE`.
 
-`patrol_client.py` es un cliente de terminal interactivo para probar todo esto a mano: `s`/`p`/`r`/`m`/`b`/`c`/`q`. El comando `m` encadena `manual_start` → `teleop_twist_keyboard` → `manual_stop` automáticamente al salir del teleop con Ctrl+C.
+`patrol_client.py` es un cliente de terminal interactivo para probar todo esto a mano: `s`/`p`/`r`/`m`/`b`/`c`/`q`. El comando `m` encadena `manual_start` → `teleop_twist_keyboard` → `manual_stop` automáticamente al salir del teleop con Ctrl+C. `teleop_twist_keyboard` se lanza con su salida remapeada a `cmd_vel_teleop` (no al `cmd_vel` final) — ver "Arbitraje de velocidad" más abajo.
 
 Los waypoints se leen de un YAML (`config/waypoints.yaml`, lista plana de `name`/`x`/`y`/`yaw`; el primero es la base) vía el parámetro ROS `waypoints_file`. Sin acciones por punto ni agenda todavía — eso es alcance futuro, cuando haya algo real que las use. Si el archivo falta o está mal formado, el nodo falla al arrancar en vez de arrancar en silencio con datos por defecto.
 
@@ -146,6 +146,12 @@ Tres capas, probadas en vivo en la simulación, no solo en teoría:
 
 La política solo actúa si el robot está `EN_RONDA` en ese momento (desde `PAUSADO`/`MANUAL`/`FALLA`/`EN_BASE` no hay nada que "continuar" o "volver"). El evento `enlace_perdido_prolongado`, en cambio, se dispara siempre que se cumple el umbral, **incluso con la política en `continue`** — es puramente para que el panel lo marque con más urgencia si alguien está mirando en vivo, no dispara ninguna acción por sí solo.
 
+### Arbitraje de velocidad y dead-man timer del teleop — ahora en `robot_bringup` (implementado 2026-08-14)
+
+Nav2 y el teleop ya no escriben los dos al mismo `cmd_vel` sin árbitro, y el dead-man timer de ~500ms que pide el CLAUDE.md ya está implementado de verdad. Se resolvió en un paquete nuevo y separado, **`robot_bringup`** (no adentro de `patrol_fsm` ni tocando el submódulo `andino_gz`) — ver `robot_bringup/README.md` para el detalle completo (por qué es un paquete aparte, cómo arbitra `twist_mux`, y un hallazgo importante: `twist_mux` no trae un dead-man timer propio, hubo que agregarle un watchdog al lado).
+
+Lo único que cambió de este lado: `patrol_client.py` remapea la salida de `teleop_twist_keyboard` a `cmd_vel_teleop` en vez del `cmd_vel` final (una línea), para que `robot_bringup` pueda arbitrarlo. Nada de la máquina de estados se tocó — `patrol_fsm` sigue sin saber que `twist_mux` existe.
+
 ## Comportamientos no obvios (aprendidos probando en simulación)
 
 - **`start_patrol` y `resume_patrol` no "arrancan de cero"**: `current_goal` (el índice del waypoint pendiente) solo avanza cuando se completa un waypoint estando en `EN_RONDA`. Ni `return_to_base` ni `clear_failure` lo resetean. Entonces si mandás el robot a la base a mitad de ronda (`b`) y después arrancás de nuevo (`s`), retoma en el waypoint donde había quedado, no en el 0. Es el comportamiento buscado (no repetir lo ya recorrido), pero el nombre `start_patrol` puede confundir.
@@ -156,16 +162,3 @@ La política solo actúa si el robot está `EN_RONDA` en ese momento (desde `PAU
 
 - **Sin acciones por punto ni agenda/horario** en el YAML de waypoints.
 - **Sin disparo automático de retorno a base** por batería baja — `return_to_base` es siempre manual.
-
-### Sin integración con twist_mux (prioridades e-stop > teleoperación > navegación) — investigado, no implementado
-
-Hoy Nav2 y el teleop (`teleop_twist_keyboard`) escriben los dos al **mismo tópico** `cmd_vel`, sin ningún árbitro — el bridge de Gazebo recibe los mensajes de ambos mezclados, sin poder distinguir de dónde vino cada uno. `twist_mux` es la pieza estándar de ROS 2 para resolver esto (prioridades + timeout tipo dead-man por fuente + un "lock" separado para e-stop, que es justo el mecanismo correcto para eso — corta todo sin pasar por la lógica de prioridades normal).
-
-**Por qué no está hecho todavía:** para que `twist_mux` realmente controle el robot (no solo decida "en el aire" sin que nadie lo escuche), hace falta que el consumidor final del `cmd_vel` deje de escuchar la salida cruda de Nav2 y pase a escuchar la salida ya arbitrada de `twist_mux`. En simulación, ese consumidor final es el bridge de Gazebo — y la línea que lo conecta está en `andino_gz/config/bridge_config.yaml`, **adentro del submódulo git `andino_gz`**, sin ningún argumento de launch para pasarle una ruta alternativa (a diferencia de `world_name`/`map`/`params_file`, que sí son parametrizables). El remapeo final de Nav2 hacia `cmd_vel` tampoco es tocable desde afuera: está hardcodeado adentro del propio paquete de sistema `nav2_bringup`, no es configuración de `andino_gz`.
-
-**Riesgo de la solución (editar una línea de `bridge_config.yaml`):**
-- Es una modificación local a un archivo trackeado dentro de un submódulo de terceros — diverge del repo original (`github.com/ekumenlabs/andino_gz`).
-- Si algún día se actualiza el submódulo (`git submodule update`), esa línea se puede pisar o entrar en conflicto, y si nadie se acuerda de reaplicarla, `twist_mux` queda armado pero sin efecto — Nav2 y teleop vuelven a chocar sin arbitrar en `cmd_vel`, **en silencio, sin ningún error que lo avise**. Hay que tenerlo presente como checklist post-actualización del submódulo si esto se implementa.
-- No es lógica de Nav2/AMCL/slam_toolbox/ros2_control (que es lo que el CLAUDE.md dice no reescribir) — es una tabla de nombres de tópicos específica de la simulación en Gazebo, sin ningún equivalente en el robot físico.
-
-**Alcance:** esto es 100% específico de la simulación. En el robot físico, el "último cable" hacia los motores reales sería otro mecanismo (`ros2_control` con el driver real), que hoy no existe en este repo — habrá que resolver el mismo problema ahí, por separado, cuando llegue ese momento. La config de `twist_mux` en sí (prioridades, timeouts, e-stop como lock) sí se porta sin cambios entre simulación, Andino físico, y el rover propio a futuro.

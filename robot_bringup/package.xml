@@ -1,0 +1,26 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>robot_bringup</name>
+  <version>0.1.0</version>
+  <description>
+    Arranque de la plataforma de movimiento del robot (Nav2 + arbitraje de
+    velocidad con twist_mux), separado de andino_gz (solo simulacion) y de
+    patrol_fsm (logica de rondas). Pensado para que el dia que cambie la
+    plataforma (Andino fisico, o el rover propio a futuro) solo cambie el
+    contenido de este paquete.
+  </description>
+  <author email="tomash@tysse.com.ar">Tomas</author>
+  <maintainer email="tomash@tysse.com.ar">Tomas</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>nav2_bringup</exec_depend>
+  <exec_depend>twist_mux</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

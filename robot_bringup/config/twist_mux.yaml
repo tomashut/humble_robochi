@@ -1,0 +1,23 @@
+# Arbitraje de velocidad: quien puede mover el robot y con que prioridad.
+#
+# timeout es el dead-man timer -- si no llega un Twist nuevo en ese lapso
+# por ese topico, se lo descarta y se asume velocidad 0 para esa fuente.
+# Que teleop tenga mayor prioridad que navegacion es intencional: un
+# humano manejando manda por sobre Nav2 si ambos publicaran a la vez (en
+# la practica no pasa, patrol_fsm cancela el goal activo de Nav2 antes de
+# entrar en MANUAL -- esto es la red de seguridad, no el mecanismo
+# principal).
+#
+# Sin locks todavia -- el e-stop de hardware queda para cuando vuelva el
+# Andino fisico.
+twist_mux:
+  ros__parameters:
+    topics:
+      navigation:
+        topic: cmd_vel_nav
+        timeout: 0.5
+        priority: 10
+      teleop:
+        topic: cmd_vel_teleop
+        timeout: 0.5
+        priority: 100
