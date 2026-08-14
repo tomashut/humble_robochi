@@ -55,12 +55,22 @@ def make_node(tmp_path, rclpy_context, waypoints=None, **param_overrides):
     return PatrolNode(wait_for_nav2=False, parameter_overrides=overrides)
 
 
-def write_estado(tmp_path, state, actividad_previa=None, current_goal=1):
-    """Simula un state.json dejado por un corte, en el estado que sea."""
+def write_estado(
+        tmp_path, state, actividad_previa=None, current_goal=1, waypoints=None,
+        current_waypoint=None):
+    """
+    Simula un state.json dejado por un corte, en el estado que sea.
+
+    current_waypoint tiene prioridad si se pasa (para simular directamente
+    un nombre que ya no existe en la lista actual); si no, se resuelve a
+    partir de current_goal contra TEST_WAYPOINTS (o waypoints, si se pasa).
+    """
     state_file = tmp_path / 'state.json'
+    if current_waypoint is None:
+        current_waypoint = (waypoints or TEST_WAYPOINTS)[current_goal]['name']
     payload = {
         'state': state,
-        'current_goal': current_goal,
+        'current_waypoint': current_waypoint,
         'fail_count': 0,
         'round_id': '20260811-000000000',
     }
@@ -181,6 +191,49 @@ def test_doble_reinicio_en_interrumpido_conserva_la_actividad_previa(tmp_path, r
         assert node.state == PatrolState.INTERRUMPIDO
         assert node.actividad_previa == 'RETORNO'
         assert node._auto_resume_timer is not None
+    finally:
+        node.destroy_node()
+
+
+# -- persistencia por nombre de waypoint, no por indice crudo ----------------
+
+def test_reinicio_con_waypoints_reordenados_retoma_el_waypoint_correcto(tmp_path, rclpy_context):
+    """
+    El indice como current_goal no es estable entre reinicios.
+
+    Si waypoints.yaml cambia entre el guardado y la carga (agregar/sacar
+    una parada corre a los demas), guardar el NOMBRE del waypoint evita que
+    el robot retome en el lugar fisico equivocado sin ningun error visible.
+    """
+    write_estado(tmp_path, 'EN_RONDA', current_goal=2)  # 'wp2' en TEST_WAYPOINTS
+
+    # entre el guardado y el reinicio, alguien inserta una parada nueva
+    # ANTES de wp2 -- wp2 ya no esta en la posicion 2, se corrio a la 3.
+    waypoints_reordenados = [
+        {'name': 'base', 'x': 0.0, 'y': 0.0, 'yaw': 0.0},
+        {'name': 'wp1', 'x': 1.0, 'y': 0.0, 'yaw': 0.0},
+        {'name': 'parada_nueva', 'x': 5.0, 'y': 5.0, 'yaw': 0.0},
+        {'name': 'wp2', 'x': 1.0, 'y': 1.0, 'yaw': 0.0},
+    ]
+    node = make_node(tmp_path, rclpy_context, waypoints=waypoints_reordenados)
+    try:
+        assert node.waypoint_names[node.current_goal] == 'wp2'
+    finally:
+        node.destroy_node()
+
+
+def test_reinicio_con_waypoint_pendiente_borrado_descarta_el_estado(tmp_path, rclpy_context):
+    """
+    Sin el waypoint pendiente en la lista actual, no hay forma segura de resolverlo.
+
+    Se descarta como estado corrupto, mismo camino que cualquier otro dato
+    invalido, en vez de adivinar.
+    """
+    write_estado(tmp_path, 'EN_RONDA', current_waypoint='wp_que_ya_no_existe')
+    node = make_node(tmp_path, rclpy_context)
+    try:
+        assert node.state == PatrolState.EN_BASE
+        assert node.current_goal == 0
     finally:
         node.destroy_node()
 

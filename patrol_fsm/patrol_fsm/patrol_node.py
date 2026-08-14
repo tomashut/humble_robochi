@@ -436,8 +436,13 @@ class PatrolNode(Node):
             with open(self.state_file) as f:
                 data = json.load(f)
             PatrolState(data['state'])  # valida que el valor sea un estado conocido
-            if not (0 <= data['current_goal'] < len(self.waypoints)):
-                raise ValueError('current_goal fuera de rango')
+            # se persiste el NOMBRE del waypoint, no su posicion en la lista --
+            # si waypoints.yaml se reordena/edita entre el guardado y esta
+            # carga (agregar/sacar una parada), un indice crudo apuntaria
+            # silenciosamente a un waypoint distinto del que en realidad
+            # estaba pendiente. Si el nombre ya no existe, se trata como
+            # estado corrupto (mismo camino que cualquier otro dato invalido).
+            data['current_goal'] = self.waypoint_names.index(data['current_waypoint'])
             return data
         except (json.JSONDecodeError, OSError, KeyError, ValueError) as e:
             self.get_logger().warn(
@@ -448,7 +453,7 @@ class PatrolNode(Node):
     def _save_state(self):
         payload = {
             'state': self.state.value,
-            'current_goal': self.current_goal,
+            'current_waypoint': self.waypoint_names[self.current_goal],
             'fail_count': self.fail_count,
             'round_id': self.round_id,
             'actividad_previa': self.actividad_previa,
