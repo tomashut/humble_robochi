@@ -72,7 +72,17 @@ class CommsAgentNode(Node):
         # WireGuard en produccion).
         self._link_status_pub = self.create_publisher(Bool, 'link_status', state_qos)
 
-        self._mqtt = mqtt.Client()
+        # client_id fijo + clean_session=False: le pide a Mosquitto que
+        # retenga los comandos QoS 1 (topico .../cmd) que lleguen mientras
+        # este desconectado, y los entregue al reconectar -- con
+        # clean_session=True (el default de la libreria) el broker no tiene
+        # de quien acordarse entre conexiones, y un comando mandado durante
+        # un corte se pierde para siempre, aunque el enlace vuelva. clean_id
+        # fijo es necesario: paho no deja combinar clean_session=False con
+        # un client_id auto-generado (cambia en cada conexion, Mosquitto no
+        # lo reconoceria como "el mismo cliente de antes").
+        client_id = f'comms_agent-{installation_id}-{robot_id}'
+        self._mqtt = mqtt.Client(client_id=client_id, clean_session=False)
         if mqtt_username:
             self._mqtt.username_pw_set(mqtt_username, mqtt_password)
         self._mqtt.on_connect = self._on_mqtt_connect
