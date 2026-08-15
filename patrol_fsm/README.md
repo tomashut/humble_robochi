@@ -65,7 +65,7 @@ El nodo escribe un JSON Lines por día (`rounds_log_dir`, default `~/.local/shar
 | `goal_failed` | Cada intento fallido de Nav2 (rechazado, abortado, cancelado sin pedirlo). | `reason`, `fail_count` |
 | `round_ended` | Se cierra la ronda. | `result`: `completada` (dio la vuelta completa al circuito y arranca otra al toque), `retorno_a_base` (se cortó por un `return_to_base` exitoso), `falla` (llegó a `FALLA` por reintentos de Nav2), o `localizacion_perdida` (llegó a `FALLA` por perder la confianza en AMCL navegando). |
 | `falla_reconocida` | `clear_failure`. | — |
-| `reiniciado` | El nodo arranca y encuentra un estado persistido que no era `EN_BASE`/`FALLA` (aterriza en `INTERRUMPIDO` o `PAUSADO` según el caso, ver más abajo). | `estado_anterior` |
+| `reiniciado` | El nodo arranca y encuentra un estado persistido que no era `EN_BASE`/`FALLA` (aterriza en `INTERRUMPIDO` o `PAUSADO` según el caso, ver más abajo). | `estado_anterior`, `segundos_desde_guardado` (ausente si el `state.json` es de antes de este campo, o si `saved_at` está corrupto) |
 | `auto_resume_girando_para_converger` | Desde `INTERRUMPIDO`, se cumplió el timeout y arranca el giro de convergencia antes de decidir. | — |
 | `auto_resume_esperando_localizacion` | El giro terminó pero la localización sigue sin ser confiable — no reanuda, reintenta en el próximo ciclo. | — |
 | `localizacion_perdida` | La vigilancia continua detectó que se perdió la confianza en AMCL mientras navegaba (`EN_RONDA`/`RETORNO`) — pasa a `FALLA`. | `estado` (desde cuál de los dos) |
@@ -87,7 +87,7 @@ Cada línea escrita acá también sale, en el mismo instante y con el mismo JSON
 
 ## Persistencia de estado (sobrevive reinicios)
 
-El nodo guarda su estado (`state`, `current_waypoint`, `fail_count`, `round_id`, `actividad_previa`) en un JSON (`state_file`, default `~/.local/share/patrol_fsm/state.json`) cada vez que algo de eso cambia, con escritura atómica (archivo temporal + rename) para no corromperlo si se corta la luz justo en el medio.
+El nodo guarda su estado (`state`, `current_waypoint`, `fail_count`, `round_id`, `actividad_previa`, `saved_at`) en un JSON (`state_file`, default `~/.local/share/patrol_fsm/state.json`) cada vez que algo de eso cambia, con escritura atómica (archivo temporal + rename) para no corromperlo si se corta la luz justo en el medio.
 
 **Se persiste el nombre del waypoint pendiente, no su posición en la lista (2026-08-14).** Antes se guardaba `current_goal` como índice crudo (`3`, por ejemplo). El problema: ese índice solo es válido mientras `waypoints.yaml` no cambie entre el guardado y la próxima carga. Si entre medio alguien edita la ronda — agrega una parada nueva, saca una, las reordena — todos los índices posteriores al cambio se corren, sin que nadie haya tocado el waypoint que en realidad estaba pendiente. El robot, al reiniciar, retomaba en "la posición 3 de la lista actual", que podía ser un waypoint físicamente distinto del que había quedado pendiente — sin ningún error, sin ningún síntoma, un punto de la instalación silenciosamente sin cubrir esa noche. Ahora se guarda `current_waypoint` con el **nombre** del waypoint (`'wp3'`); al cargar, se busca ese nombre en la lista actual y se resuelve a la posición que le corresponda hoy, sea cual sea. Internamente el nodo sigue trabajando con un índice en memoria (`current_goal`) — la resolución por nombre pasa solo en el borde de persistencia (`_save_state`/`_load_saved_state`), no hizo falta tocar el resto de la lógica.
 
@@ -106,6 +106,8 @@ Al arrancar, según el estado guardado:
 | `PAUSADO` | Igual, `PAUSADO` | **No, nunca** — es una pausa deliberada, un humano ya decidió frenarlo |
 
 Cada uno de estos aterrizajes agrega un evento `reiniciado` al registro de ejecuciones (con `estado_anterior`), para que quede documentado por qué esa ronda se demoró.
+
+**`saved_at` — desde cuándo estaba pendiente lo que se retoma (2026-08-15).** El payload de `state.json` ahora incluye `saved_at` (mismo formato ISO que usa `_log_event()` en el JSONL), actualizado en cada guardado. Al reiniciar, si el estado persistido no era `EN_BASE`/`FALLA`, el evento `reiniciado` lleva además `segundos_desde_guardado` — sin esto, un reinicio de 30 segundos y uno de 3 días se veían exactamente igual, y en ambos casos se retomaba la misma ronda vieja sin ninguna señal de que había pasado tanto tiempo. Es puramente informativo por ahora — no cambia ninguna decisión de la FSM, solo mejora la trazabilidad del libro de rondas. `state.json` de antes de este campo (sin `saved_at`) o con un valor corrupto (por ejemplo, editado a mano) siguen cargando bien — el campo se omite del evento en vez de tumbar el arranque.
 
 Si el archivo de estado no existe, está corrupto, o su `current_waypoint` ya no existe en la lista actual de waypoints (por ejemplo, se borró esa parada), se ignora con un warning y arranca fresco desde `EN_BASE` (a diferencia del YAML de waypoints, que sí falla duro si está mal — acá preferimos degradar a un estado seguro antes que impedir que el nodo arranque).
 

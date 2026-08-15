@@ -123,14 +123,30 @@ class PatrolNode(Node):
             self.round_id = None
             self.actividad_previa = None
             previous_state = None
+            self._reiniciado_extra = {}
         else:
             self.current_goal = saved_state['current_goal']
             self.fail_count = saved_state['fail_count']
             self.round_id = saved_state['round_id']
-            # .get() a proposito: archivos de estado de antes de este campo
-            # no lo tienen.
+            # .get() a proposito: archivos de estado de antes de estos campos
+            # no los tienen.
             self.actividad_previa = saved_state.get('actividad_previa')
             previous_state = PatrolState(saved_state['state'])
+            saved_at = saved_state.get('saved_at')
+            self._reiniciado_extra = {}
+            if saved_at is not None:
+                # cuanto hace que se guardo ese estado -- sin esto no se
+                # distingue un reinicio de 30s de uno de 3 dias, y en ambos
+                # casos se retomaria la misma ronda vieja igual. Si esta mal
+                # formado (state.json editado a mano, por ejemplo), no tiene
+                # por que invalidar el resto del estado -- se ignora nomas.
+                try:
+                    segundos_desde_guardado = round(
+                        (datetime.now().astimezone()
+                         - datetime.fromisoformat(saved_at)).total_seconds())
+                    self._reiniciado_extra = {'segundos_desde_guardado': segundos_desde_guardado}
+                except ValueError:
+                    pass
 
         self._current_goal_handle = None
         self._expected_cancel = False
@@ -182,7 +198,8 @@ class PatrolNode(Node):
                 'Estado persistido era MANUAL; por seguridad arranca en PAUSADO -- nadie '
                 'retoma el control manual solo. Pedí /resume_patrol, /manual_start o '
                 '/return_to_base.')
-            self._log_event('reiniciado', estado_anterior=previous_state.value)
+            self._log_event(
+                'reiniciado', estado_anterior=previous_state.value, **self._reiniciado_extra)
             self._enter_state(PatrolState.PAUSADO)
         elif previous_state == PatrolState.PAUSADO:
             # ya estaba pausado -- por un humano, la unica forma de llegar
@@ -190,7 +207,8 @@ class PatrolNode(Node):
             self.get_logger().warn(
                 'Estado persistido era PAUSADO; se mantiene igual. Nadie retoma una '
                 'pausa deliberada solo.')
-            self._log_event('reiniciado', estado_anterior=previous_state.value)
+            self._log_event(
+                'reiniciado', estado_anterior=previous_state.value, **self._reiniciado_extra)
             self._enter_state(PatrolState.PAUSADO)
         else:
             # EN_RONDA, RETORNO, o INTERRUMPIDO (reinicio encima de un
@@ -202,7 +220,8 @@ class PatrolNode(Node):
                 f'Estado persistido era {previous_state.value}; por seguridad arranca en '
                 'INTERRUMPIDO en vez de reanudar navegación solo. Pedí /resume_patrol, '
                 '/pause_patrol o /return_to_base.')
-            self._log_event('reiniciado', estado_anterior=previous_state.value)
+            self._log_event(
+                'reiniciado', estado_anterior=previous_state.value, **self._reiniciado_extra)
             if previous_state != PatrolState.INTERRUMPIDO:
                 self.actividad_previa = previous_state.value
             # si previous_state YA era INTERRUMPIDO, se conserva la
@@ -457,6 +476,7 @@ class PatrolNode(Node):
             'fail_count': self.fail_count,
             'round_id': self.round_id,
             'actividad_previa': self.actividad_previa,
+            'saved_at': datetime.now().astimezone().isoformat(timespec='seconds'),
         }
         tmp_path = self.state_file.with_suffix('.tmp')
         try:

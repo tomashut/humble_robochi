@@ -8,7 +8,7 @@ depender de una simulacion levantada.
 """
 
 import json
-from datetime import date
+from datetime import date, datetime, timedelta
 
 import yaml
 import pytest
@@ -57,13 +57,15 @@ def make_node(tmp_path, rclpy_context, waypoints=None, **param_overrides):
 
 def write_estado(
         tmp_path, state, actividad_previa=None, current_goal=1, waypoints=None,
-        current_waypoint=None):
+        current_waypoint=None, saved_at=None):
     """
     Simula un state.json dejado por un corte, en el estado que sea.
 
     current_waypoint tiene prioridad si se pasa (para simular directamente
     un nombre que ya no existe en la lista actual); si no, se resuelve a
     partir de current_goal contra TEST_WAYPOINTS (o waypoints, si se pasa).
+    saved_at ausente por default -- simula un state.json de antes de que
+    ese campo existiera.
     """
     state_file = tmp_path / 'state.json'
     if current_waypoint is None:
@@ -76,7 +78,15 @@ def write_estado(
     }
     if actividad_previa is not None:
         payload['actividad_previa'] = actividad_previa
+    if saved_at is not None:
+        payload['saved_at'] = saved_at
     state_file.write_text(json.dumps(payload))
+
+
+def ultimo_evento(tmp_path):
+    """Lee la ultima linea del JSONL de rondas de hoy."""
+    log_path = tmp_path / 'rondas' / f'{date.today().isoformat()}.jsonl'
+    return json.loads(log_path.read_text().strip().splitlines()[-1])
 
 
 def amcl_pose_con_covarianza(var_x, var_y, var_yaw):
@@ -191,6 +201,58 @@ def test_doble_reinicio_en_interrumpido_conserva_la_actividad_previa(tmp_path, r
         assert node.state == PatrolState.INTERRUMPIDO
         assert node.actividad_previa == 'RETORNO'
         assert node._auto_resume_timer is not None
+    finally:
+        node.destroy_node()
+
+
+# -- timestamp de state.json: hace cuanto se guardo lo que se retoma --------
+
+def test_save_state_incluye_saved_at(tmp_path, rclpy_context):
+    node = make_node(tmp_path, rclpy_context)
+    try:
+        node._save_state()
+        payload = json.loads((tmp_path / 'state.json').read_text())
+        # no revienta al parsearlo -- alcanza como chequeo, el valor exacto
+        # depende del reloj real.
+        datetime.fromisoformat(payload['saved_at'])
+    finally:
+        node.destroy_node()
+
+
+def test_reinicio_calcula_segundos_desde_guardado(tmp_path, rclpy_context):
+    hace_un_rato = (datetime.now().astimezone() - timedelta(hours=3)).isoformat(
+        timespec='seconds')
+    write_estado(tmp_path, 'EN_RONDA', saved_at=hace_un_rato)
+    node = make_node(tmp_path, rclpy_context)
+    try:
+        evento = ultimo_evento(tmp_path)
+        assert evento['event'] == 'reiniciado'
+        # ~3 horas, con margen por el tiempo que tarda el test en correr.
+        assert 10770 <= evento['segundos_desde_guardado'] <= 10830
+    finally:
+        node.destroy_node()
+
+
+def test_reinicio_sin_saved_at_no_rompe_ni_agrega_el_campo(tmp_path, rclpy_context):
+    """state.json de antes de que este campo existiera -- debe seguir andando."""
+    write_estado(tmp_path, 'EN_RONDA')  # sin saved_at, default de write_estado
+    node = make_node(tmp_path, rclpy_context)
+    try:
+        assert node.state == PatrolState.INTERRUMPIDO
+        evento = ultimo_evento(tmp_path)
+        assert 'segundos_desde_guardado' not in evento
+    finally:
+        node.destroy_node()
+
+
+def test_reinicio_con_saved_at_invalido_no_rompe_el_arranque(tmp_path, rclpy_context):
+    """Un saved_at corrupto (state.json editado a mano) no debe tumbar el nodo."""
+    write_estado(tmp_path, 'EN_RONDA', saved_at='esto-no-es-una-fecha')
+    node = make_node(tmp_path, rclpy_context)
+    try:
+        assert node.state == PatrolState.INTERRUMPIDO
+        evento = ultimo_evento(tmp_path)
+        assert 'segundos_desde_guardado' not in evento
     finally:
         node.destroy_node()
 
