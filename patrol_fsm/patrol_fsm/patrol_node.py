@@ -1,5 +1,6 @@
 import json
 import math
+import os
 import shutil
 from datetime import date, datetime
 from enum import Enum
@@ -482,6 +483,13 @@ class PatrolNode(Node):
         try:
             with open(tmp_path, 'w') as f:
                 json.dump(payload, f)
+                # sin esto, el contenido puede quedar solo en el buffer del
+                # SO (no en el disco de verdad) cuando se cierra el archivo
+                # -- un corte de luz justo ahi lo perderia igual, aunque
+                # Python ya haya "terminado" de escribir. fsync fuerza la
+                # bajada real al disco antes de seguir con el rename.
+                f.flush()
+                os.fsync(f.fileno())
             tmp_path.replace(self.state_file)
         except OSError as e:
             # disco lleno/solo-lectura no debe matar el nodo -- el robot
