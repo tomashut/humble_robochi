@@ -40,9 +40,9 @@
 </style>
 </head>
 <body>
-  <h1>patrol_fsm — panel v0 (mapa: depot)</h1>
+  <h1>patrol_fsm — panel v0 (mapa: mapa1)</h1>
   <div id="layout">
-    <canvas id="mapa" width="1210" height="618"></canvas>
+    <canvas id="mapa" width="545" height="530"></canvas>
     <div id="panel">
       <div id="estado" class="estado-desconocido">sin datos</div>
       <button id="btn-start" disabled>Iniciar ronda</button>
@@ -61,19 +61,19 @@
   </div>
 
 <script>
-// depot.yaml: resolution 0.05 m/px, origin [-7.99, -6.67, 0], imagen 605x309 px
+// mapa1.yaml: resolution 0.05 m/px, origin [10, 10, 0], imagen 109x106 px
 const MAP_RESOLUTION = 0.05;
-const MAP_ORIGIN_X = -7.99;
-const MAP_ORIGIN_Y = -6.67;
-const MAP_IMG_W = 605;
-const MAP_IMG_H = 309;
-const SCALE = 2; // el canvas se dibuja al doble para que se vea mejor
+const MAP_ORIGIN_X = 10;
+const MAP_ORIGIN_Y = 10;
+const MAP_IMG_W = 109;
+const MAP_IMG_H = 106;
+const SCALE = 5; // el canvas se dibuja 5x mas grande para que se vea mejor
 
 // -- mapa + posicion --
 const canvas = document.getElementById('mapa');
 const ctx = canvas.getContext('2d');
 const mapImg = new Image();
-mapImg.src = 'depot.png';
+mapImg.src = 'mapa1.png';
 let lastPos = null; // {x, y, yaw}
 
 function mapToPixel(x, y) {

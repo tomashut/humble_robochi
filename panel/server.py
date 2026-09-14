@@ -121,7 +121,7 @@ async def handle_index(request):
 async def handle_map_image(request):
     if not get_session(request):
         raise web.HTTPFound('/login')
-    return web.FileResponse(PANEL_DIR / 'depot.png')
+    return web.FileResponse(PANEL_DIR / 'mapa1.png')
 
 
 async def handle_ws(request):
@@ -224,7 +224,7 @@ def create_app(mqtt_host, mqtt_port, mqtt_username, mqtt_password):
     app.router.add_post('/login', handle_login_post)
     app.router.add_post('/logout', handle_logout)
     app.router.add_get('/', handle_index)
-    app.router.add_get('/depot.png', handle_map_image)
+    app.router.add_get('/mapa1.png', handle_map_image)
     app.router.add_get('/ws', handle_ws)
 
     async def on_startup(app):
