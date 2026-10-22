@@ -2,3 +2,7 @@
 	path = src/andino_gz
 	url = https://github.com/ekumenlabs/andino_gz.git
 	branch = humble
+[submodule "src/Andino"]
+	path = src/Andino
+	url = https://github.com/tomashut/Andino.git
+	branch = main
