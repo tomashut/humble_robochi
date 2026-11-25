@@ -19,8 +19,6 @@ navegador  <--WebSocket propio, con login-->  server.py  <--MQTT (paho-mqtt)--> 
 - Una vez logueado, el navegador habla con `server.py` por un WebSocket propio (JSON simple: `{"type": "state", "data": "EN_RONDA"}`, etc.), no por MQTT. `server.py` es el que efectivamente publica/suscribe a Mosquitto de un lado, y reenvía todo al navegador del otro.
 - `mqtt.js` ya no se usa (se borró `mqtt.min.js`) — el navegador usa el `WebSocket` nativo del navegador, no necesita ninguna librería.
 
-Analogía (la misma que fuimos usando para pensar esto): antes, el navegador era un huésped de hotel al que le dábamos una copia de la llave maestra para que entrara solo a cualquier puerta. Ahora el navegador le pide las cosas al recepcionista (`server.py`), y es el recepcionista el único que tiene la llave maestra y la usa por vos — si a un huésped le roban su credencial, no sirve para nada fuera de esta recepción.
-
 ## Qué hace hoy
 
 - **Login**: `/login` muestra un formulario, valida contra `users.json` (contraseñas con PBKDF2-SHA256 + salt, 310.000 iteraciones — mismo nivel de esfuerzo que usa Django por default). Si es correcto, `server.py` crea una sesión en memoria y pone una cookie `panel_session` (`HttpOnly`, no accesible desde JavaScript). La sesión dura 12 horas (un turno de guardia) o hasta que se reinicie `server.py` (las sesiones no se guardan a disco — ver "Qué falta").
